@@ -56,9 +56,9 @@
 ### 一键准备与编译
 
 ```powershell
-git clone https://github.com/<your-user>/AudioSub.git
+git clone https://github.com/NJUPTzza/AudioSub.git
 cd AudioSub
-.\scripts\bootstrap.ps1 -Url "https://github.com/<your-user>/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release.zip"
+.\scripts\bootstrap.ps1 -Url "https://github.com/NJUPTzza/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release-771e6489c9.zip"
 ```
 
 如果维护者已经把默认 SDK 地址写进了 [scripts/fetch-webrtc-sdk.ps1](scripts/fetch-webrtc-sdk.ps1)，则直接运行：

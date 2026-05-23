@@ -49,7 +49,7 @@ $VersionPath = Join-Path $SdkDir "VERSION.txt"
 # GitHub release asset URL example:
 #   https://github.com/<user>/<repo>/releases/download/<tag>/webrtc-sdk-win-x64-release-<commit>.zip
 # =====================================================================
-$DefaultReleaseUrl = ""
+$DefaultReleaseUrl = "https://github.com/NJUPTzza/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release-771e6489c9.zip"
 $EnvReleaseUrl = [Environment]::GetEnvironmentVariable("AUDIOSUB_WEBRTC_SDK_URL")
 $ResolvedDefaultUrl = if (-not [string]::IsNullOrWhiteSpace($EnvReleaseUrl)) {
     $EnvReleaseUrl
