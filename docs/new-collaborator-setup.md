@@ -36,7 +36,7 @@
 ## 3. 首次使用步骤
 
 ```powershell
-git clone https://github.com/<your-user>/AudioSub.git
+git clone https://github.com/NJUPTzza/AudioSub.git
 cd AudioSub
 ```
 
@@ -51,7 +51,7 @@ cd AudioSub
 ### 方式 B：维护者给你发了单独的 SDK 下载地址
 
 ```powershell
-.\scripts\bootstrap.ps1 -Url "https://github.com/<your-user>/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release.zip"
+.\scripts\bootstrap.ps1 -Url "https://github.com/NJUPTzza/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release-771e6489c9.zip"
 ```
 
 ### 方式 C：你已经拿到了本地 SDK 目录
@@ -137,7 +137,7 @@ python .\scripts\test_stage1a.py
 示例：
 
 ```powershell
-$env:AUDIOSUB_WEBRTC_SDK_URL="https://github.com/<your-user>/<repo>/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release.zip"
+$env:AUDIOSUB_WEBRTC_SDK_URL="https://github.com/NJUPTzza/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release-771e6489c9.zip"
 .\scripts\bootstrap.ps1
 ```
 

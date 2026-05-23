@@ -1,6 +1,6 @@
 # AudioSub 组员接入消息模板
 
-下面这段可以直接发到群里，按你的实际仓库地址和 SDK 下载地址替换占位符。
+下面这段已经按当前仓库和 SDK 地址填好了，直接复制发给组员即可。
 
 ## 版本 A：我已经把默认 SDK 地址写进脚本
 
@@ -15,7 +15,7 @@
 - Git
 
 2. 拉代码：
-git clone https://github.com/<your-user>/AudioSub.git
+git clone https://github.com/NJUPTzza/AudioSub.git
 cd AudioSub
 
 3. 一键准备并编译：
@@ -45,11 +45,11 @@ docs\new-collaborator-setup.md
 - Git
 
 2. 拉代码：
-git clone https://github.com/<your-user>/AudioSub.git
+git clone https://github.com/NJUPTzza/AudioSub.git
 cd AudioSub
 
 3. 一键准备并编译：
-.\scripts\bootstrap.ps1 -Url "https://github.com/<your-user>/<repo>/releases/download/<tag>/webrtc-sdk-win-x64-release-<commit>.zip"
+.\scripts\bootstrap.ps1 -Url "https://github.com/NJUPTzza/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release-771e6489c9.zip"
 
 4. 跑 demo（开 3 个终端）：
 终端1：python signaling\server.py
@@ -62,11 +62,7 @@ cd AudioSub
 docs\new-collaborator-setup.md
 ```
 
-## 建议你发消息前替换的内容
+## 当前已填入的信息
 
-- `<your-user>`
-- `<repo>`
-- `<tag>`
-- `<commit>`
-- `GitHub` 仓库实际地址
-- `SDK` 实际下载地址
+- GitHub 仓库地址：`https://github.com/NJUPTzza/AudioSub`
+- SDK 下载地址：`https://github.com/NJUPTzza/AudioSub/releases/download/webrtc-sdk-v1.0.0/webrtc-sdk-win-x64-release-771e6489c9.zip`
