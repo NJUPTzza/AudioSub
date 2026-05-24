@@ -2,6 +2,41 @@
 
 基于 `WebRTC-Native` 的语音转写与标注系统，当前仓库提供一个可运行的最小骨架，并围绕“多人协作、环境不统一”的现实前提，设计了基于预编译 `WebRTC SDK` 的团队开发方案。
 
+## 目录结构
+
+```text
+AudioSub/
+├── client/                         C++ 客户端主程序、WebRTC 接线
+├── docs/                           协作、接入与规划文档
+├── include/
+│   └── audiosub/
+│       ├── asr/                    ASR 模块头文件目录
+│       ├── audio/                  音频模块头文件目录
+│       ├── core/                   公共类型与接口头文件目录
+│       ├── fusion/                 融合模块头文件目录
+│       ├── mark/                   标注模块头文件目录
+│       └── ui/                     展示模块头文件目录
+├── scripts/
+│   ├── bootstrap.ps1               一键准备环境 + 构建
+│   ├── build.ps1                   构建入口
+│   ├── fetch-webrtc-sdk.ps1        获取预编译 SDK
+│   ├── pack-webrtc-sdk.ps1         维护者打包 SDK
+│   ├── test_stage1a.py             基础信令验证
+│   └── test_stage1b.py             WebRTC P2P 验证
+├── signaling/                      Python 信令服务器
+├── src/
+│   ├── asr/                        ASR 模块实现
+│   ├── audio/                      音频模块实现
+│   ├── fusion/                     融合模块目录
+│   ├── mark/                       标注模块目录
+│   └── ui/                         展示模块目录
+├── third_party/
+│   ├── nlohmann/json.hpp
+│   └── webrtc-sdk/                 本地生成，默认不入库
+├── CMakeLists.txt
+└── README.md
+```
+
 ## 项目目标
 
 课题目标分两层：
@@ -146,26 +181,6 @@ Client A  ──TCP/JSON──► Signaling Server ◄──TCP/JSON── Clien
     │                                              │
     └──────────── WebRTC P2P DataChannel ──────────┘
                   （文字/音频后续都走这里）
-```
-
-## 目录结构
-
-```text
-AudioSub/
-├── client/                     C++ 客户端
-├── signaling/                  Python 信令服务器
-├── docs/                       协作与接入文档
-├── scripts/
-│   ├── bootstrap.ps1           一键准备环境 + 构建
-│   ├── build.ps1               构建入口
-│   ├── fetch-webrtc-sdk.ps1    获取预编译 SDK
-│   ├── pack-webrtc-sdk.ps1     维护者打包 SDK
-│   ├── test_stage1a.py
-│   └── test_stage1b.py
-├── third_party/
-│   ├── nlohmann/json.hpp
-│   └── webrtc-sdk/             本地生成，默认不入库
-└── CMakeLists.txt
 ```
 
 ## 常见问题
