@@ -93,6 +93,7 @@ target_include_directories(audiosub_core INTERFACE
 add_library(audiosub_audio STATIC
     "${CMAKE_SOURCE_DIR}/src/audio/pcm_ring_buffer.cc"
     "${CMAKE_SOURCE_DIR}/src/audio/pass_through_audio_pipeline.cc"
+    "${CMAKE_SOURCE_DIR}/src/audio/wav_writer.cc"
 )
 add_library(audiosub::audio ALIAS audiosub_audio)
 target_link_libraries(audiosub_audio PUBLIC audiosub::core)

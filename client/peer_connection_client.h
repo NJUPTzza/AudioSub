@@ -73,12 +73,19 @@
 #include <mutex>
 #include <string>
 
+#include "audiosub/core/types.h"
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
+
+namespace webrtc {
+class ScopedCOMInitializer;
+class AudioDeviceModule;
+class Environment;
+}
 
 namespace audiosub {
 
@@ -105,6 +112,15 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 收到对端通过 DataChannel 发来的一条文字消息。
   using MessageCallback = std::function<void(const std::string& text)>;
 
+  // 收到远端音频轨道解码后的 PCM 数据。用于把 WebRTC 音频链路接到后续
+  // ring buffer / audio pipeline / ASR。
+  using RemoteAudioFrameCallback =
+      std::function<void(const core::PcmFrame& frame)>;
+
+  // 收到本地麦克风轨道上的 PCM 数据。用于确认 A 端本地采集是否真的有声音。
+  using LocalAudioFrameCallback =
+      std::function<void(const core::PcmFrame& frame)>;
+
   // 状态变化通知（信令状态、ICE 状态、PeerConnection 状态、DataChannel 状态等）。
   // 仅用于打印/UI 显示，不影响逻辑。
   using StateCallback = std::function<void(const std::string& state)>;
@@ -123,6 +139,31 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // A 端入口：创建一个名为 "chat" 的 DataChannel，然后生成 Offer。
   // Offer 生成完会通过 SdpReadyCallback 通知业务侧。
   bool CreateOfferAndDataChannel();
+
+  // 在本端挂一条来自系统麦克风的音频轨道。
+  // 约定在 A 端创建 Offer 之前调用一次，让首个 Offer 就带上音频 m= section。
+  bool EnableLocalAudio();
+
+  // 控制本地音频轨道是否向对端发送有效语音。
+  // true  表示 A 端开始讲话；
+  // false 表示 A 端结束讲话（轨道仍保留，但发送静音）。
+  bool SetLocalAudioEnabled(bool enabled);
+
+  // === 麦克风自测（独立于 PeerConnection 协商）===
+  //
+  // 用途：在没有 B 端、没有 SDP/ICE 协商的情况下，验证"麦克风到底能不能
+  // 被本进程采集到"。WebRTC 默认要等 AudioSendStream 激活才会启动 ADM，
+  // 因此即便 EnableLocalAudio() + SetLocalAudioEnabled(true) 在本地也不
+  // 会触发 OnCaptureData。这两个方法显式地把 ADM 的录音生命周期拉起，让
+  // AdmCaptureObserver 立刻开始往业务侧投递 PCM。
+  //
+  // 调用前提：Initialize() 已经成功，ADM 已经创建好。
+  // 也可以在普通 A 端流程里调用，用于"提前 warm-up 一下 ADM"。
+  bool StartLocalCaptureSelfTest();
+  bool StopLocalCaptureSelfTest();
+
+  // 把当前进程能看到的录音设备打印到 stderr，仅诊断用。
+  void LogRecordingDevices() const;
 
   // B 端入口：在 SetRemoteSdp(kOffer, ...) 之后调用，生成 Answer。
   // Answer 生成完通过 SdpReadyCallback 通知。
@@ -147,6 +188,12 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   void SetSdpReadyCallback(SdpReadyCallback cb) { sdp_ready_cb_ = std::move(cb); }
   void SetIceCandidateCallback(IceCandidateCallback cb) { ice_cb_ = std::move(cb); }
   void SetMessageCallback(MessageCallback cb) { message_cb_ = std::move(cb); }
+  void SetRemoteAudioFrameCallback(RemoteAudioFrameCallback cb) {
+    remote_audio_frame_cb_ = std::move(cb);
+  }
+  void SetLocalAudioFrameCallback(LocalAudioFrameCallback cb) {
+    local_audio_frame_cb_ = std::move(cb);
+  }
   void SetStateCallback(StateCallback cb) { state_cb_ = std::move(cb); }
 
   // === PeerConnectionObserver 接口实现（WebRTC 触发） ===
@@ -160,6 +207,11 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 我们在这里 RegisterObserver，绑定到 this 上接收消息。
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override;
+
+  // Unified Plan 下，远端媒体轨道会在 SetRemoteDescription 过程中从这里到达。
+  // 第一个需求需要在这里抓到远端音频轨道并注册 PCM sink。
+  void OnTrack(
+      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
 
   // 协商需要重新走一遍（比如改了媒体配置）。我们暂时不处理。
   void OnRenegotiationNeeded() override {}
@@ -197,6 +249,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   class CreateSdpObserver;       // 接 CreateOffer/CreateAnswer 的异步结果
   class SetLocalDescObserver;    // 接 SetLocalDescription 的异步结果
   class SetRemoteDescObserver;   // 接 SetRemoteDescription 的异步结果
+  class RemoteAudioSink;         // 把 WebRTC AudioTrack 回调转成统一 PcmFrame
+  class AdmCaptureObserver;      // 直接从音频设备层拿本地麦克风 PCM
 
   // CreateOffer/CreateAnswer 成功后被嵌套类调用。
   void OnLocalSdpReady(std::unique_ptr<webrtc::SessionDescriptionInterface> desc);
@@ -210,6 +264,10 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   void AttachDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> ch);
 
+  // 供 RemoteAudioSink 回调，把 PCM 转交给业务侧。
+  void DeliverLocalAudioFrame(const core::PcmFrame& frame);
+  void DeliverRemoteAudioFrame(const core::PcmFrame& frame);
+
   // === 状态 ===
 
   // WebRTC 的 3 个内部线程，规范要求：
@@ -220,6 +278,11 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   std::unique_ptr<webrtc::Thread> network_thread_;
   std::unique_ptr<webrtc::Thread> worker_thread_;
   std::unique_ptr<webrtc::Thread> signaling_thread_;
+
+  // 本地麦克风采集依赖平台音频设备模块。Windows 下需要先把当前线程初始化为 COM。
+  std::unique_ptr<webrtc::ScopedCOMInitializer> com_initializer_;
+  std::unique_ptr<webrtc::Environment> env_;
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm_;
 
   // PeerConnectionFactory 是创建 PeerConnection 的工厂。整个进程一般共享一个，
   // 这里为了简化每个 PeerConnectionClient 自己持有一份。
@@ -233,10 +296,19 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   std::mutex dc_mutex_;
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc_;
 
+  // 本地发送的麦克风轨道，以及远端到达后绑定 sink 的音频轨道。
+  std::mutex audio_mutex_;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> local_audio_source_;
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> local_audio_track_;
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track_;
+  std::unique_ptr<RemoteAudioSink> remote_audio_sink_;
+
   // === 业务回调 ===
   SdpReadyCallback sdp_ready_cb_;
   IceCandidateCallback ice_cb_;
   MessageCallback message_cb_;
+  LocalAudioFrameCallback local_audio_frame_cb_;
+  RemoteAudioFrameCallback remote_audio_frame_cb_;
   StateCallback state_cb_;
 };
 
