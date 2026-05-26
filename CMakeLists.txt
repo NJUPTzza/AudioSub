@@ -29,6 +29,8 @@ set(WEBRTC_SDK_DIR "${CMAKE_SOURCE_DIR}/third_party/webrtc-sdk" CACHE PATH
     "Directory containing lib/webrtc.lib and include/")
 set(WEBRTC_LIB "${WEBRTC_SDK_DIR}/lib/webrtc.lib" CACHE FILEPATH
     "WebRTC monolithic static library")
+set(WEBRTC_ADM_LIB "${WEBRTC_SDK_DIR}/lib/webrtc_adm.lib" CACHE FILEPATH
+    "WebRTC Windows Core Audio ADM supplement library")
 set(WEBRTC_INCLUDE_DIR "${WEBRTC_SDK_DIR}/include" CACHE PATH
     "WebRTC public headers root (contains api/, rtc_base/, ...)")
 
@@ -63,6 +65,8 @@ set_target_properties(webrtc::webrtc PROPERTIES
         "WEBRTC_WIN;NOMINMAX;WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0A00;_HAS_EXCEPTIONS=0;_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS"
 )
 target_link_libraries(webrtc::webrtc INTERFACE
+    "${WEBRTC_ADM_LIB}"
+
     winmm.lib
     secur32.lib
     dmoguids.lib
@@ -76,6 +80,8 @@ target_link_libraries(webrtc::webrtc INTERFACE
     dwmapi.lib
     d3d11.lib
     dxgi.lib
+    ole32.lib
+    avrt.lib
 )
 
 if(MSVC)
@@ -100,11 +106,52 @@ target_include_directories(audiosub_audio PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
 )
 
+# --- whisper.cpp ---
+set(WHISPER_CPP_DIR "D:/webrtc_work/whisper.cpp" CACHE PATH
+    "Path to local whisper.cpp checkout")
+
+set(WHISPER_INCLUDE_DIR "${WHISPER_CPP_DIR}/include" CACHE PATH
+    "whisper.cpp include directory")
+set(WHISPER_GGML_INCLUDE_DIR "${WHISPER_CPP_DIR}/ggml/include" CACHE PATH
+    "ggml include directory")
+set(WHISPER_LIB "${WHISPER_CPP_DIR}/build/src/Release/whisper.lib" CACHE FILEPATH
+    "whisper.cpp import library")
+
+set(WHISPER_BIN_DIR "${WHISPER_CPP_DIR}/build/bin/Release" CACHE PATH
+    "whisper.cpp runtime dll directory")
+
+if(NOT EXISTS "${WHISPER_INCLUDE_DIR}/whisper.h")
+    message(FATAL_ERROR "whisper.h not found at ${WHISPER_INCLUDE_DIR}/whisper.h")
+endif()
+if(NOT EXISTS "${WHISPER_GGML_INCLUDE_DIR}/ggml.h")
+    message(FATAL_ERROR "ggml.h not found at ${WHISPER_GGML_INCLUDE_DIR}/ggml.h")
+endif()
+if(NOT EXISTS "${WHISPER_LIB}")
+    message(FATAL_ERROR "whisper.lib not found at ${WHISPER_LIB}")
+endif()
+
+if(NOT EXISTS "${WHISPER_BIN_DIR}/whisper.dll")
+    message(FATAL_ERROR "whisper.dll not found at ${WHISPER_BIN_DIR}/whisper.dll")
+endif()
+
+add_library(whispercpp::whisper SHARED IMPORTED GLOBAL)
+set_target_properties(whispercpp::whisper PROPERTIES
+    IMPORTED_IMPLIB "${WHISPER_LIB}"
+    IMPORTED_LOCATION "${WHISPER_BIN_DIR}/whisper.dll"
+    INTERFACE_INCLUDE_DIRECTORIES "${WHISPER_INCLUDE_DIR};${WHISPER_GGML_INCLUDE_DIR}"
+)
+
+file(GLOB WHISPER_RUNTIME_DLLS "${WHISPER_BIN_DIR}/*.dll")
+
 add_library(audiosub_asr STATIC
     "${CMAKE_SOURCE_DIR}/src/asr/null_asr_engine.cc"
+    "${CMAKE_SOURCE_DIR}/src/asr/whisper_asr_engine.cc"
 )
 add_library(audiosub::asr ALIAS audiosub_asr)
-target_link_libraries(audiosub_asr PUBLIC audiosub::core)
+target_link_libraries(audiosub_asr PUBLIC
+    audiosub::core
+    whispercpp::whisper
+)
 target_include_directories(audiosub_asr PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
 )

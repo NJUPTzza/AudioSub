@@ -11,6 +11,7 @@ add_executable(audiosub_client
     main.cc
     signaling_client.cc
     peer_connection_client.cc
+    wasapi_mic_capture.cc
 )
 
 # 头文件搜索路径：
@@ -38,4 +39,14 @@ target_link_libraries(audiosub_client PRIVATE
     audiosub::asr
     webrtc::webrtc
     ws2_32.lib
+    ole32.lib
+    avrt.lib
 )
+# Copy whisper.cpp runtime DLLs next to audiosub_client.exe.
+foreach(_whisper_dll ${WHISPER_RUNTIME_DLLS})
+    add_custom_command(TARGET audiosub_client POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_whisper_dll}"
+            "$<TARGET_FILE_DIR:audiosub_client>"
+    )
+endforeach()

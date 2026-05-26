@@ -14,8 +14,11 @@ class NullASREngine : public core::IASREngine {
   }
 
  private:
-  core::ISubtitleConsumer* consumer_ = nullptr;
-  int64_t last_seen_timestamp_ms_ = 0;
+     core::ISubtitleConsumer* consumer_ = nullptr;
+     int64_t last_seen_timestamp_ms_ = 0;
+
+     int64_t accumulated_samples_ = 0;
+     int64_t segment_index_ = 0;
 };
 
 }  // namespace audiosub::asr
