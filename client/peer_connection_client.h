@@ -66,20 +66,22 @@
 // ============================================================================
 
 #pragma once
-
+#include "audiosub/core/interfaces.h"
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
-
+#include "api/audio/audio_device.h"
+#include "api/environment/environment_factory.h"
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
+#include "api/media_stream_interface.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
-
+#include "wasapi_mic_capture.h"
 namespace audiosub {
 
 // PeerConnectionClient 同时实现两个 WebRTC 回调接口：
@@ -148,7 +150,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   void SetIceCandidateCallback(IceCandidateCallback cb) { ice_cb_ = std::move(cb); }
   void SetMessageCallback(MessageCallback cb) { message_cb_ = std::move(cb); }
   void SetStateCallback(StateCallback cb) { state_cb_ = std::move(cb); }
-
+  void SetAudioFrameConsumer(core::IAudioFrameConsumer* consumer)
+  {audio_consumer_ = consumer;}
   // === PeerConnectionObserver 接口实现（WebRTC 触发） ===
   // 这些方法都是 WebRTC 内部线程回调过来的，不能阻塞太久。
 
@@ -160,6 +163,9 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 我们在这里 RegisterObserver，绑定到 this 上接收消息。
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override;
+  // 收到远端媒体轨道。P0 音频链路在这里接收远端 AudioTrack。
+  void OnTrack(
+      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
 
   // 协商需要重新走一遍（比如改了媒体配置）。我们暂时不处理。
   void OnRenegotiationNeeded() override {}
@@ -197,7 +203,7 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   class CreateSdpObserver;       // 接 CreateOffer/CreateAnswer 的异步结果
   class SetLocalDescObserver;    // 接 SetLocalDescription 的异步结果
   class SetRemoteDescObserver;   // 接 SetRemoteDescription 的异步结果
-
+  class RemoteAudioSink;
   // CreateOffer/CreateAnswer 成功后被嵌套类调用。
   void OnLocalSdpReady(std::unique_ptr<webrtc::SessionDescriptionInterface> desc);
 
@@ -209,9 +215,15 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // B 端在 OnDataChannel 里调一次（被动接收）。
   void AttachDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> ch);
-
+  // A 端：创建并添加本地音频轨道，让 offer SDP 包含 audio。
+  bool AddLocalAudioTrack();
   // === 状态 ===
+  bool SendPcmDataChannel(const int16_t* samples,
+      size_t sample_count,
+      int sample_rate,
+      int channels);
 
+  void HandlePcmDataChannel(const webrtc::DataBuffer& buffer);
   // WebRTC 的 3 个内部线程，规范要求：
   //   network_thread   跑 socket I/O（必须用 CreateWithSocketServer）
   //   worker_thread    跑编解码、媒体处理
@@ -220,11 +232,12 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   std::unique_ptr<webrtc::Thread> network_thread_;
   std::unique_ptr<webrtc::Thread> worker_thread_;
   std::unique_ptr<webrtc::Thread> signaling_thread_;
-
+  WasapiMicCapture wasapi_mic_;
   // PeerConnectionFactory 是创建 PeerConnection 的工厂。整个进程一般共享一个，
   // 这里为了简化每个 PeerConnectionClient 自己持有一份。
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
-
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> audio_device_module_;
+  bool com_initialized_ = false;
   // 真正的 P2P 连接对象。
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
 
@@ -232,7 +245,14 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 触发 OnMessage），用 mutex 保护它的指针读写。
   std::mutex dc_mutex_;
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc_;
-
+  bool is_offer_side_ = false;
+  bool a_ready_prompt_printed_ = false;
+  // A 端本地音频轨道。持有引用，避免被提前释放。
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> local_audio_track_;
+  core::IAudioFrameConsumer* audio_consumer_ = nullptr;
+  // B 端远端音频轨道和 PCM sink。
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track_;
+  std::unique_ptr<RemoteAudioSink> remote_audio_sink_;
   // === 业务回调 ===
   SdpReadyCallback sdp_ready_cb_;
   IceCandidateCallback ice_cb_;

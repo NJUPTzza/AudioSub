@@ -17,3 +17,4 @@ build-*.log
 # Prebuilt WebRTC SDK (downloaded or packed locally; not committed to git)
 third_party/webrtc-sdk/
 !third_party/webrtc-sdk/README.md
+.Rhistory
