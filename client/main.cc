@@ -6,31 +6,7 @@
 //   3. 把"WebRTC 生成的 SDP/ICE"转发到信令通道
 //      把"信令通道收到的 SDP/ICE"喂回 WebRTC
 //   4. 主线程跑 std::getline 读用户输入，调 SendMessage 发到 P2P
-//
-// 这里就是阶段 1b 的全部业务逻辑——大约 100 行。
-//
-// 流程示意：
-//
-//   stdin (用户输入)                stdout (打印)
-//        |                              ^
-//        v                              |
-//   ┌────────────────────────────────────────┐
-//   │ main 主线程：getline 循环              │
-//   │   收到字符串 -> pc.SendMessage()       │
-//   └────────────────────────────────────────┘
-//                  |   ^
-//                  v   |   (P2P 数据)
-//   ┌──────────────────────────────────────────┐
-//   │ PeerConnectionClient (内部 3 线程)       │
-//   └──────────────────────────────────────────┘
-//      ^回调                  | 回调
-//      | SDP/ICE              v
-//   ┌──────────────────────────────────────────┐
-//   │ SignalingClient (1 后台 recv 线程)        │
-//   └──────────────────────────────────────────┘
-//          ^                      |
-//          | TCP/JSON 上行         v 下行
-//          +---- 信令服务器 -------+
+
 
 #include <atomic>
 #include <chrono>
@@ -42,38 +18,244 @@
 
 #include <nlohmann/json.hpp>
 
-#include "audiosub/audio/pcm_ring_buffer.h"
-#include "audiosub/audio/wav_writer.h"
+#include "audio/pcm_ring_buffer.h"
 #include "peer_connection_client.h"
 #include "signaling_client.h"
 
-namespace {
+int main(int argc, char** argv) {
+  // 解析命令行参数
+  Args args;
+  if (!ParseArgs(argc, argv, &args)) {
+    PrintUsage(argv[0]);
+    return 1;
+  }
 
+  // 角色判定：约定 A 是 offerer，B 是 answerer。
+  // 后面逻辑基于 A 主动创建 offer，B 被动等待 offer
+  const bool is_offerer = (args.id == "A");
+
+  // 初始化 WebRTC 核心对象
+  // 创建 PeerConnectionClient
+  // 启动 WebRTC 三个线程
+  // 创建 PeerConnectionFactory 和 PeerConnection
+  audiosub::PeerConnectionClient pc;
+  if (!pc.Initialize()) {
+    std::cerr << "PeerConnectionClient::Initialize() failed\n";
+    return 2;
+  }
+
+  // 创建两个 PCM 缓冲区，分别用于本地采集和对端接收
+  audiosub::audio::PcmRingBuffer local_audio_buffer(/*capacity_frames=*/128);
+  audiosub::audio::PcmRingBuffer remote_audio_buffer(/*capacity_frames=*/128);
+  // 启动两个监控线程
+  std::thread local_audio_worker([&local_audio_buffer]() {
+    RunAudioLevelMonitor(local_audio_buffer, "local");
+  });
+  std::thread remote_audio_worker([&remote_audio_buffer]() {
+    RunAudioLevelMonitor(remote_audio_buffer, "remote");
+  });
+
+  // 创建信令客户端对象
+  audiosub::SignalingClient signaling;
+
+  // 应用层接线。把底层回调映射到业务动作。
+  // 当本地生成 offer 或 answer 时，把它包装成 JSON，通过 signaling.Send() 发出去
+  pc.SetSdpReadyCallback(
+      [&signaling](webrtc::SdpType type, const std::string& sdp) {
+        std::string type_str =
+            (type == webrtc::SdpType::kOffer) ? "offer" : "answer";
+        nlohmann::json msg = {{"type", type_str}, {"sdp", sdp}};
+        signaling.Send(msg);
+        Println(std::string("[pc] local ") + type_str + " sent (" +
+                std::to_string(sdp.size()) + " bytes)");
+      });
+
+  // 当本地产生一个 ICE candidate 时，通过信令发给对端
+  pc.SetIceCandidateCallback(
+      [&signaling](const std::string& candidate, const std::string& mid,
+                   int mline) {
+        nlohmann::json msg = {{"type", "candidate"},
+                              {"candidate", candidate},
+                              {"sdpMid", mid},
+                              {"sdpMLineIndex", mline}};
+        signaling.Send(msg);
+      });
+
+  // 通过 DataChannel 收到对端发来的文本消息，打印出来
+  pc.SetMessageCallback([](const std::string& text) {
+    Println(std::string("<peer> ") + text);
+  });
+
+  // 本地 PCM 来了以后，放进 local_audio_buffer
+  pc.SetLocalAudioFrameCallback([&local_audio_buffer](
+                                    const audiosub::core::PcmFrame& frame) {
+    if (!local_audio_buffer.Push(frame)) {
+      std::cerr << "[audio] dropping local PCM frame: ring buffer closed\n";
+    }
+  });
+  
+  // 远端 PCM 来了以后，放进 remote_audio_buffer
+  pc.SetRemoteAudioFrameCallback([&remote_audio_buffer](
+                                     const audiosub::core::PcmFrame& frame) {
+    if (!remote_audio_buffer.Push(frame)) {
+      std::cerr << "[audio] dropping remote PCM frame: ring buffer closed\n";
+    }
+  });
+
+  // 把各种状态变化打印出来，比如 pc:connected 、 dc:open
+  pc.SetStateCallback([](const std::string& state) {
+    Println(std::string("[state] ") + state);
+  });
+
+  // 如果是 A 端（offerer），提前把本地音频轨加进 PeerConnection，默认先静音
+  // 这样后续切换成讲话状态时不需要做二次协商
+  if (is_offerer && !pc.EnableLocalAudio()) {
+    std::cerr << "PeerConnectionClient::EnableLocalAudio() failed\n";
+    local_audio_buffer.Close();
+    remote_audio_buffer.Close();
+    local_audio_worker.join();
+    remote_audio_worker.join();
+    pc.Close();
+    return 4;
+  }
+  if (is_offerer && !pc.SetLocalAudioEnabled(false)) {
+    std::cerr << "PeerConnectionClient::SetLocalAudioEnabled(false) failed\n";
+    local_audio_buffer.Close();
+    remote_audio_buffer.Close();
+    local_audio_worker.join();
+    remote_audio_worker.join();
+    pc.Close();
+    return 5;
+  }
+
+  // 这里给 信令服务器 设置消息处理函数，处理对端发来的不同类型信令消息
+  // 信令消息类型有：peer_ready、peer_left、offer、answer、candidate
+  signaling.SetMessageHandler(
+      [&pc, is_offerer](const nlohmann::json& msg) {
+        std::string type = msg.value("type", "");
+        // peer_ready 表示对端上线了
+        if (type == "peer_ready") {
+          Println(std::string("[peer] ") + msg.value("peer", "?") +
+                  " is online");
+          // 如果自己是 A 端（offerer），则主动发起 DataChannel + Offer
+          if (is_offerer) {
+            Println("[pc] creating Offer + DataChannel...");
+            pc.CreateOfferAndDataChannel();
+          }
+          // 如果自己是 B 端（answerer），则不做任何事，等收到 offer。
+
+        // peer_left 表示对端下线了
+        } else if (type == "peer_left") {
+          Println(std::string("[peer] ") + msg.value("peer", "?") + " left");
+
+        // offer 表示 B 收到 A 的 offer
+        } else if (type == "offer") {
+          //  B 端接收 A 端发来的 offer(sdp)，将对端提出的连接方案告诉本地 WebRTC
+          //  再调 CreateAnswer 生成应答
+          Println("[pc] received Offer from peer");
+          pc.SetRemoteSdp(webrtc::SdpType::kOffer, msg.value("sdp", ""));
+          pc.CreateAnswer();
+
+        // answer 表示 A 收到 B 的 answer
+        } else if (type == "answer") {
+          // A 端接收 B 端发来的 answer(sdp)，将对端提出的连接方案告诉本地 WebRTC
+          Println("[pc] received Answer from peer");
+          pc.SetRemoteSdp(webrtc::SdpType::kAnswer, msg.value("sdp", ""));
+
+        // candidate 表示 收到对端的 ICE candidate
+        } else if (type == "candidate") {
+          // 直接喂给 WebRTC
+          pc.AddRemoteIceCandidate(msg.value("sdpMid", ""),
+                                   msg.value("sdpMLineIndex", 0),
+                                   msg.value("candidate", ""));
+
+        } else {
+          Println(std::string("[signal] unhandled type=") + type);
+        }
+      });
+
+  // 连接信令服务器，发送 hello 并等待 peer_ready
+  // 这一步会发出 hello。如果对端已经在线，会立刻收到 peer_ready
+  // 触发上面的逻辑去 CreateOffer / 等待 offer
+  if (!signaling.Connect(args.host, args.port, args.id)) {
+    return 3;
+  }
+
+  // 提示语，告诉用户当前角色和可用命令
+  std::cout << "Role: " << (is_offerer ? "A (offerer)" : "B (answerer)")
+            << "\n"
+            << "Commands: /talk on, /talk off, /quit\n"
+            << "Type text to send after DataChannel opens.\n"
+            << "Waiting for peer...\n"
+            << "[you] " << std::flush;
+
+  // 主线程 stdin 循环（文本消息 + /talk 命令）。
+  // 对用户输入的文本消息，直接通过 DataChannel 发送
+  // 对 talk 相关命令，根据是否是 A 端（offerer），分别触发本地音频轨的静音/取消静音
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (line == "/quit" || line == "/exit") break;
+    if (line.empty()) {
+      std::cout << "[you] " << std::flush;
+      continue;
+    }
+    // talk on: 触发 A 端开始送麦克风音频。
+    if (line == "/talk on") {
+      if (!is_offerer) {
+        Println("[audio] only A can control local microphone speech");
+      } else if (!pc.SetLocalAudioEnabled(true)) {
+        Println("[audio] failed to start talking");
+      } else {
+        Println("[audio] talking enabled on A");
+      }
+      continue;
+    }
+    // talk off: 停止发送有效语音（保留轨道）。
+    if (line == "/talk off") {
+      if (!is_offerer) {
+        Println("[audio] only A can control local microphone speech");
+      } else if (!pc.SetLocalAudioEnabled(false)) {
+        Println("[audio] failed to stop talking");
+      } else {
+        Println("[audio] talking disabled on A");
+      }
+      continue;
+    }
+    // 普通文本消息：直接通过 DataChannel 发送
+    if (!pc.SendMessage(line)) {
+      Println("(message dropped: data channel not open yet)");
+    } else {
+      std::cout << "[you] " << std::flush;
+    }
+  }
+
+  // 清理：先关信令（这样不会再有新 SDP/ICE 进来），再关 WebRTC（停所有线程）。
+  signaling.Close();
+  pc.Close();
+  local_audio_buffer.Close();
+  remote_audio_buffer.Close();
+  if (local_audio_worker.joinable()) {
+    local_audio_worker.join();
+  }
+  if (remote_audio_worker.joinable()) {
+    remote_audio_worker.join();
+  }
+  std::cout << "bye.\n";
+  return 0;
+}
+
+namespace {
+// 打印命令行帮助。
+// 提示文本，不参与任何音频/信令逻辑。
 void PrintUsage(const char* prog) {
   std::cout
-      << "Usage: " << prog
-      << " --id <A|B> [--host 127.0.0.1] [--port 8888] [--mic-test]\n"
-      << "       [--dump-wav <path>]\n"
+      << "Usage: " << prog << " --id <A|B> [--host <host>] [--port <port>]\n"
       << "\n"
-      << "Stage 2 demo: A captures microphone audio, WebRTC sends it to B,\n"
-      << "and B logs decoded PCM frames while both peers can still chat over\n"
-      << "the DataChannel.\n"
-      << "\n"
-      << "Role:\n"
-      << "  A: offerer (adds microphone track, creates DataChannel and Offer)\n"
-      << "  B: answerer (waits for Offer, receives remote audio track)\n"
-      << "\n"
-      << "Commands:\n"
-      << "  /talk on   start sending microphone audio from A\n"
-      << "  /talk off  stop sending microphone audio from A\n"
-      << "  /quit      exit\n"
-      << "\n"
-      << "Standalone mic test (no peer / no signaling needed):\n"
-      << "  --mic-test           drive ADM directly, print live mic level\n"
-      << "  --dump-wav <path>    dump captured PCM to a 16-bit WAV file\n"
-      << "                       (works in --mic-test and in normal A mode)\n"
-      << "\n"
-      << "Any other text is still sent over the DataChannel.\n";
+      << "Required:\n"
+      << "  --id <A|B>\n"
+      << "Optional:\n"
+      << "  --host <host>    default: 127.0.0.1\n"
+      << "  --port <port>    default: 8888\n";
 }
 
 // 命令行参数。--id 必填。
@@ -81,8 +263,6 @@ struct Args {
   std::string id;            // "A" 或 "B"
   std::string host = "127.0.0.1";
   int port = 8888;
-  bool mic_test = false;
-  std::string dump_wav_path;   // 非空时把采到的本地 PCM 写到这个 WAV 里
 };
 
 // 简易命令行解析：循环识别 --xxx <value>，碰到 -h/--help 返回 false 触发用法说明。
@@ -102,11 +282,6 @@ bool ParseArgs(int argc, char** argv, Args* out) {
       if (const char* v = next("--host")) out->host = v; else return false;
     } else if (a == "--port") {
       if (const char* v = next("--port")) out->port = std::atoi(v); else return false;
-    } else if (a == "--mic-test") {
-      out->mic_test = true;
-    } else if (a == "--dump-wav") {
-      if (const char* v = next("--dump-wav")) out->dump_wav_path = v;
-      else return false;
     } else if (a == "-h" || a == "--help") {
       return false;
     } else {
@@ -200,286 +375,4 @@ void RunAudioLevelMonitor(audiosub::audio::PcmRingBuffer& buffer,
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  Args args;
-  if (!ParseArgs(argc, argv, &args)) {
-    PrintUsage(argv[0]);
-    return 1;
-  }
 
-  // 角色判定：本项目约定 A 是 offerer，B 是 answerer。
-  // 这只是一个客户端层面的约定，信令服务器不关心谁先发 offer。
-  const bool is_offerer = (args.id == "A");
-
-  // === 第 1 步：先把 WebRTC 准备好（启动线程 + 创建 PeerConnection）===
-  audiosub::PeerConnectionClient pc;
-  if (!pc.Initialize()) {
-    std::cerr << "PeerConnectionClient::Initialize() failed\n";
-    return 2;
-  }
-
-  audiosub::audio::PcmRingBuffer local_audio_buffer(/*capacity_frames=*/128);
-  audiosub::audio::PcmRingBuffer remote_audio_buffer(/*capacity_frames=*/128);
-  std::thread local_audio_worker([&local_audio_buffer]() {
-    RunAudioLevelMonitor(local_audio_buffer, "local");
-  });
-  std::thread remote_audio_worker([&remote_audio_buffer]() {
-    RunAudioLevelMonitor(remote_audio_buffer, "remote");
-  });
-
-  audiosub::SignalingClient signaling;
-
-  // === 第 2 步：把 WebRTC 的 4 个回调接到"通过信令送出"或"打到控制台"===
-
-  // 本端 SDP 生成完成 -> 通过信令送给对端。
-  // type 是 kOffer 或 kAnswer，根据当前角色而定。
-  pc.SetSdpReadyCallback(
-      [&signaling](webrtc::SdpType type, const std::string& sdp) {
-        std::string type_str =
-            (type == webrtc::SdpType::kOffer) ? "offer" : "answer";
-        nlohmann::json msg = {{"type", type_str}, {"sdp", sdp}};
-        signaling.Send(msg);
-        Println(std::string("[pc] local ") + type_str + " sent (" +
-                std::to_string(sdp.size()) + " bytes)");
-      });
-
-  // 发现一个本端 ICE candidate -> 也送给对端。
-  // 注意 sdpMid 和 sdpMLineIndex 必须原样回传，对端解析时要用。
-  pc.SetIceCandidateCallback(
-      [&signaling](const std::string& candidate, const std::string& mid,
-                   int mline) {
-        nlohmann::json msg = {{"type", "candidate"},
-                              {"candidate", candidate},
-                              {"sdpMid", mid},
-                              {"sdpMLineIndex", mline}};
-        signaling.Send(msg);
-      });
-
-  // P2P 通道上收到对端文字 -> 直接打印到控制台。
-  pc.SetMessageCallback([](const std::string& text) {
-    Println(std::string("<peer> ") + text);
-  });
-
-  // 可选：把本地采到的 PCM 同步写一份到 WAV 文件，便于事后用任意播放器
-  // 回放确认"麦克风真的把声音收进来了"。WavWriter 自己内部加锁，可以从
-  // WebRTC 的音频线程直接调用。
-  audiosub::audio::WavWriter local_wav;
-  if (!args.dump_wav_path.empty()) {
-    if (!local_wav.Open(args.dump_wav_path)) {
-      std::cerr << "[audio] failed to open WAV dump: " << args.dump_wav_path
-                << "\n";
-    } else {
-      std::cout << "[audio] dumping local PCM to " << args.dump_wav_path
-                << "\n";
-    }
-  }
-
-  pc.SetLocalAudioFrameCallback([&local_audio_buffer, &local_wav](
-                                    const audiosub::core::PcmFrame& frame) {
-    if (!local_audio_buffer.Push(frame)) {
-      std::cerr << "[audio] dropping local PCM frame: ring buffer closed\n";
-    }
-    if (local_wav.is_open()) {
-      local_wav.Append(frame);
-    }
-  });
-  pc.SetRemoteAudioFrameCallback([&remote_audio_buffer](
-                                     const audiosub::core::PcmFrame& frame) {
-    if (!remote_audio_buffer.Push(frame)) {
-      std::cerr << "[audio] dropping remote PCM frame: ring buffer closed\n";
-    }
-  });
-
-  // 各种状态变化 -> 打印。仅辅助调试，不影响业务。
-  pc.SetStateCallback([](const std::string& state) {
-    Println(std::string("[state] ") + state);
-  });
-
-  // 本地麦克风自测模式：完全不依赖信令和 PeerConnection 协商，直接驱动
-  // AudioDeviceModule 录音。这是验证"麦克风到底能不能采到声音"最干净的
-  // 方式——和 WebRTC P2P 链路任何环节都解耦。
-  if (args.mic_test) {
-    if (!is_offerer) {
-      std::cerr << "--mic-test only supports --id A\n";
-      local_audio_buffer.Close();
-      remote_audio_buffer.Close();
-      if (local_audio_worker.joinable()) local_audio_worker.join();
-      if (remote_audio_worker.joinable()) remote_audio_worker.join();
-      local_wav.Close();
-      pc.Close();
-      return 6;
-    }
-
-    pc.LogRecordingDevices();
-    if (!pc.StartLocalCaptureSelfTest()) {
-      std::cerr << "Failed to start microphone self-test\n";
-      local_audio_buffer.Close();
-      remote_audio_buffer.Close();
-      if (local_audio_worker.joinable()) local_audio_worker.join();
-      if (remote_audio_worker.joinable()) remote_audio_worker.join();
-      local_wav.Close();
-      pc.Close();
-      return 7;
-    }
-
-    std::cout << "Mic test mode: ADM recording is running.\n"
-              << "Speak to your microphone and watch [audio] local ...\n"
-              << "  avg/peak should rise when you talk, drop in silence.\n"
-              << (args.dump_wav_path.empty()
-                      ? "  (tip: pass --dump-wav out.wav to save captured PCM)\n"
-                      : "  PCM is being saved to the WAV file above.\n")
-              << "Type /quit to stop.\n"
-              << "[you] " << std::flush;
-
-    std::string line;
-    while (std::getline(std::cin, line)) {
-      if (line == "/quit" || line == "/exit") break;
-      std::cout << "[you] " << std::flush;
-    }
-
-    pc.StopLocalCaptureSelfTest();
-    pc.Close();
-    local_audio_buffer.Close();
-    remote_audio_buffer.Close();
-    if (local_audio_worker.joinable()) local_audio_worker.join();
-    if (remote_audio_worker.joinable()) remote_audio_worker.join();
-    local_wav.Close();
-    std::cout << "bye.\n";
-    return 0;
-  }
-
-  // A 端在协商前就把音频轨道挂进去，但默认先置为静音。
-  // 这样首个 Offer 就已经带上音频 m= section，后续只靠命令切换讲话状态，
-  // 不需要再做二次协商。
-  if (is_offerer && !pc.EnableLocalAudio()) {
-    std::cerr << "PeerConnectionClient::EnableLocalAudio() failed\n";
-    local_audio_buffer.Close();
-    remote_audio_buffer.Close();
-    local_audio_worker.join();
-    remote_audio_worker.join();
-    local_wav.Close();
-    pc.Close();
-    return 4;
-  }
-  if (is_offerer && !pc.SetLocalAudioEnabled(false)) {
-    std::cerr << "PeerConnectionClient::SetLocalAudioEnabled(false) failed\n";
-    local_audio_buffer.Close();
-    remote_audio_buffer.Close();
-    local_audio_worker.join();
-    remote_audio_worker.join();
-    local_wav.Close();
-    pc.Close();
-    return 5;
-  }
-
-  // === 第 3 步：把信令的回调接到"喂给 WebRTC"或"决定下一步动作"===
-  signaling.SetMessageHandler(
-      [&pc, is_offerer](const nlohmann::json& msg) {
-        std::string type = msg.value("type", "");
-
-        if (type == "peer_ready") {
-          // 对端上线。A 端在这一刻"主动发起"：创建 DataChannel + Offer。
-          Println(std::string("[peer] ") + msg.value("peer", "?") +
-                  " is online");
-          if (is_offerer) {
-            Println("[pc] creating Offer + DataChannel...");
-            pc.CreateOfferAndDataChannel();
-          }
-          // B 端不主动做任何事，等收到 offer。
-
-        } else if (type == "peer_left") {
-          Println(std::string("[peer] ") + msg.value("peer", "?") + " left");
-
-        } else if (type == "offer") {
-          // B 端收到 A 端的 Offer：
-          //   先把 offer 设置为远端描述（这一步会触发 OnDataChannel）
-          //   再调 CreateAnswer 生成应答
-          Println("[pc] received Offer from peer");
-          pc.SetRemoteSdp(webrtc::SdpType::kOffer, msg.value("sdp", ""));
-          pc.CreateAnswer();
-
-        } else if (type == "answer") {
-          // A 端收到 B 端的 Answer：设置为远端描述就行，握手完成。
-          Println("[pc] received Answer from peer");
-          pc.SetRemoteSdp(webrtc::SdpType::kAnswer, msg.value("sdp", ""));
-
-        } else if (type == "candidate") {
-          // 收到对端的 ICE candidate：直接喂给 WebRTC。
-          pc.AddRemoteIceCandidate(msg.value("sdpMid", ""),
-                                   msg.value("sdpMLineIndex", 0),
-                                   msg.value("candidate", ""));
-
-        } else {
-          Println(std::string("[signal] unhandled type=") + type);
-        }
-      });
-
-  // === 第 4 步：连接信令服务器 ===
-  // 这一步会发出 hello。如果对端已经在线，会立刻收到 peer_ready，触发上面
-  // 的逻辑去 CreateOffer / 等待 offer。
-  if (!signaling.Connect(args.host, args.port, args.id)) {
-    return 3;
-  }
-
-  std::cout << "Role: " << (is_offerer ? "A (offerer)" : "B (answerer)")
-            << "\n"
-            << "Waiting for peer. Once both peers are online, the offerer "
-               "will start.\n"
-            << (is_offerer
-                    ? "A starts muted. Use /talk on and /talk off to control speech.\n"
-                    : "B will show remote audio level as silent/speaking.\n")
-            << "Type messages and Enter to send. /quit to exit.\n"
-            << "[you] " << std::flush;
-
-  // === 第 5 步：主线程进入 stdin 读循环 ===
-  // 用户每输一行就尝试通过 DataChannel 发出。dc 没 open 之前会被拒绝。
-  std::string line;
-  while (std::getline(std::cin, line)) {
-    if (line == "/quit" || line == "/exit") break;
-    if (line.empty()) {
-      std::cout << "[you] " << std::flush;
-      continue;
-    }
-    if (line == "/talk on") {
-      if (!is_offerer) {
-        Println("[audio] only A can control local microphone speech");
-      } else if (!pc.SetLocalAudioEnabled(true)) {
-        Println("[audio] failed to start talking");
-      } else {
-        Println("[audio] talking enabled on A");
-      }
-      continue;
-    }
-    if (line == "/talk off") {
-      if (!is_offerer) {
-        Println("[audio] only A can control local microphone speech");
-      } else if (!pc.SetLocalAudioEnabled(false)) {
-        Println("[audio] failed to stop talking");
-      } else {
-        Println("[audio] talking disabled on A");
-      }
-      continue;
-    }
-    if (!pc.SendMessage(line)) {
-      Println("(message dropped: data channel not open yet)");
-    } else {
-      std::cout << "[you] " << std::flush;
-    }
-  }
-
-  // === 第 6 步：清理 ===
-  // 注意顺序：先关信令（这样不会再有新 SDP/ICE 进来），再关 WebRTC（停所有线程）。
-  signaling.Close();
-  pc.Close();
-  local_audio_buffer.Close();
-  remote_audio_buffer.Close();
-  if (local_audio_worker.joinable()) {
-    local_audio_worker.join();
-  }
-  if (remote_audio_worker.joinable()) {
-    remote_audio_worker.join();
-  }
-  local_wav.Close();
-  std::cout << "bye.\n";
-  return 0;
-}

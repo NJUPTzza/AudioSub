@@ -1,6 +1,6 @@
 #pragma once
 
-#include "audiosub/core/interfaces.h"
+#include "core/interfaces.h"
 
 namespace audiosub::audio {
 

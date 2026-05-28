@@ -9,13 +9,9 @@ AudioSub/
 ├── client/                         C++ 客户端主程序、WebRTC 接线
 ├── docs/                           协作、接入与规划文档
 ├── include/
-│   └── audiosub/
-│       ├── asr/                    ASR 模块头文件目录
-│       ├── audio/                  音频模块头文件目录
-│       ├── core/                   公共类型与接口头文件目录
-│       ├── fusion/                 融合模块头文件目录
-│       ├── mark/                   标注模块头文件目录
-│       └── ui/                     展示模块头文件目录
+│   ├── asr/                        ASR 模块头文件目录
+│   ├── audio/                      音频模块头文件目录
+│   └── core/                       公共类型与接口头文件目录
 ├── scripts/
 │   ├── bootstrap.ps1               一键准备环境 + 构建
 │   ├── build.ps1                   构建入口
@@ -116,7 +112,7 @@ python signaling\server.py
 
 ## 文档导航
 
-- 协作与模块规划: [docs/collaboration-plan.md](docs/collaboration-plan.md)
+- 当前实现链路总览: [docs/current-implementation-flow.md](docs/current-implementation-flow.md)
 - 新同学入组说明: [docs/new-collaborator-setup.md](docs/new-collaborator-setup.md)
 - 发群消息模板: [docs/team-message-template.md](docs/team-message-template.md)
 

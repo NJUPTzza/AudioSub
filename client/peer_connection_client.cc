@@ -1,11 +1,5 @@
-// peer_connection_client.cc
-// =========================
-// WebRTC PeerConnection 封装的实现。
-//
-// 主要复杂度集中在 3 个地方：
-//   1. 三个 WebRTC 内部线程的启动和销毁
-//   2. SDP 异步流程：CreateOffer/Answer -> SetLocalDescription -> 信令送出
-//   3. 各种 Observer 嵌套类（WebRTC 要求 SDP observer 必须是 RefCounted）
+// 对 WebRTC PeerConnection 封装的实现
+// 将 WebRTC 复杂的机制包装成 main 中容易调用的接口
 
 #include "peer_connection_client.h"
 
@@ -26,6 +20,16 @@
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/win/scoped_com_initializer.h"
 
+// 核心方法
+// Initialize()                         初始化 WebRTC，创建线程、Factory、PeerConnection 等
+// CreateOfferAndDataChannel()          A 端发起协商，开 channel + 创建 offer
+// EnableLocalAudio()                   启用本地音频轨道，开始发送音频数据
+// SetLocalAudioEnabled()               控制语音讲话开关
+// CreateAnswer()                       B 端收到 offer 后， 生成 answer 并回 channel
+// SetRemoteSdp()                       接收对端 SDP / ICE
+// AddRemoteIceCandidate()              接收对端 ICE candidate
+// SendMessage()                        通过 DataChannel 发文字（P2P 直连）
+
 namespace audiosub {
 
 namespace {
@@ -40,7 +44,6 @@ const char kAudioTrackLabel[] = "mic";
 const char kAudioStreamId[] = "audiosub-audio";
 
 // === 一些枚举到字符串的辅助函数，仅用于打日志 ===
-
 const char* SignalingStateName(
     webrtc::PeerConnectionInterface::SignalingState s) {
   using S = webrtc::PeerConnectionInterface::SignalingState;
@@ -260,6 +263,7 @@ PeerConnectionClient::PeerConnectionClient() = default;
 PeerConnectionClient::~PeerConnectionClient() { Close(); }
 
 bool PeerConnectionClient::Initialize() {
+  // [L3] 初始化链路：SSL -> ADM -> 三线程 -> Factory -> PeerConnection。
   // 第一步：初始化 OpenSSL/BoringSSL。WebRTC 内部用到 SSL（DTLS 加密 P2P 数据），
   // 必须在创建 PeerConnection 前调用一次。重复调用也安全。
   webrtc::InitializeSSL();
@@ -376,6 +380,7 @@ bool PeerConnectionClient::Initialize() {
 }
 
 void PeerConnectionClient::Close() {
+  // [L8] 清理链路：按固定顺序释放，避免回调野指针/线程析构卡住。
   // 关闭顺序很重要：DataChannel -> PeerConnection -> Factory -> 线程
   // 反过来会出问题（线程停了之后 PeerConnection 析构会卡）。
 
@@ -402,8 +407,7 @@ void PeerConnectionClient::Close() {
     pc_->Close();
     pc_ = nullptr;
   }
-  // 如果 self-test 路径开过 ADM 录音，这里兜底停掉，避免线程关闭时
-  // ADM 还在跑回调（OnCaptureData -> 已被析构的 parent_）。
+  // 兜底停掉 ADM 的录音/播放，避免线程关闭时还有音频回调在跑。
   if (adm_ && worker_thread_) {
     worker_thread_->BlockingCall([this] {
       if (adm_->Recording()) {
@@ -433,6 +437,7 @@ void PeerConnectionClient::Close() {
 // ===========================================================================
 
 bool PeerConnectionClient::CreateOfferAndDataChannel() {
+  // [L4] 协商链路（A）：先开 DataChannel，再 CreateOffer。
   if (!pc_) return false;
 
   // 1. 先创建 DataChannel。注意：必须在 CreateOffer 之前创建，
@@ -461,6 +466,7 @@ bool PeerConnectionClient::CreateOfferAndDataChannel() {
 // 创建 AudioTrack
 // 把这条音频轨道 AddTrack 到 PeerConnection
 bool PeerConnectionClient::EnableLocalAudio() {
+  // [L5] 发送音频链路：创建并挂载本地音频轨道。
   if (!pc_ || !factory_) {
     return false;
   }
@@ -505,184 +511,8 @@ bool PeerConnectionClient::EnableLocalAudio() {
   return true;
 }
 
-bool PeerConnectionClient::StartLocalCaptureSelfTest() {
-  if (!adm_) {
-    std::cerr << "[pc] StartLocalCaptureSelfTest: ADM not available\n";
-    return false;
-  }
-  // 打开 WebRTC 详细日志，帮助定位 InitRecording 内部到底卡在 COM、格式匹配
-  // 还是 IAudioClient::Initialize。日志会输出到当前进程 stderr。
-  webrtc::LogMessage::SetLogToStderr(true);
-  webrtc::LogMessage::LogTimestamps(true);
-  webrtc::LogMessage::LogToDebug(webrtc::LS_VERBOSE);
-  bool ok = false;
-  // 这里必须在当前调用线程执行。我们在 Initialize() 里仅对当前线程做了 COM 初始化，
-  // 若切到 worker 线程直接调 ADM，Windows 端很容易在 InitRecording 失败。
-  {
-    // Init 是幂等的，重复调返回 0。
-    if (adm_->Init() != 0) {
-      std::cerr << "[pc] ADM Init() failed\n";
-      ok = false;
-      return ok;
-    }
-
-    const int16_t num_devices = adm_->RecordingDevices();
-    std::cerr << "[pc] mic-test: " << num_devices << " recording device(s)\n";
-    if (num_devices <= 0) {
-      std::cerr << "[pc] mic-test: no recording device found\n";
-      ok = false;
-      return ok;
-    }
-    for (int16_t i = 0; i < num_devices; ++i) {
-      char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-      char guid[webrtc::kAdmMaxGuidSize] = {0};
-      if (adm_->RecordingDeviceName(i, name, guid) == 0) {
-        std::cerr << "[pc] mic-test: device[" << i << "] " << name << "\n";
-      }
-    }
-
-    // 注意：RecordingIsAvailable() 内部会做一次 InitRecording + StopRecording。
-    // 对某些 Windows 设备驱动来说，这个探测会扰动后续状态，导致真正的
-    // InitRecording 失败。这里不再做该探测，直接进入真实初始化流程。
-
-    // 尝试多个设备选择策略：默认设备 -> 通信设备 -> 设备索引逐个尝试。
-    struct Candidate {
-      enum class Kind { kWinType, kIndex } kind;
-      webrtc::AudioDeviceModule::WindowsDeviceType win_type;
-      int16_t index;
-      const char* name;
-    };
-    Candidate candidates[18];
-    int candidate_count = 0;
-    // 先试索引设备，绕开 Windows "默认设备 -> collection index" 这条不稳定路径。
-    for (int16_t i = 0; i < num_devices && candidate_count < 18; ++i) {
-      candidates[candidate_count++] = {
-          Candidate::Kind::kIndex, webrtc::AudioDeviceModule::kDefaultDevice, i,
-          "index"};
-    }
-    // 再回退到默认设备策略。
-    candidates[candidate_count++] = {
-        Candidate::Kind::kWinType, webrtc::AudioDeviceModule::kDefaultDevice, -1,
-        "kDefaultDevice"};
-    candidates[candidate_count++] = {Candidate::Kind::kWinType,
-                                     webrtc::AudioDeviceModule::kDefaultCommunicationDevice, -1,
-                                     "kDefaultCommunicationDevice"};
-
-    for (int i = 0; i < candidate_count; ++i) {
-      const Candidate& c = candidates[i];
-      if (adm_->Recording()) {
-        adm_->StopRecording();
-      }
-      // 每次尝试前刷新一次设备列表，确保 capture collection 处于有效状态。
-      const int16_t refreshed_devices = adm_->RecordingDevices();
-      if (refreshed_devices <= 0) {
-        std::cerr << "[pc] mic-test: RecordingDevices refresh failed before trying "
-                  << c.name << "\n";
-        continue;
-      }
-      int rc_set = -1;
-      if (c.kind == Candidate::Kind::kWinType) {
-        rc_set = adm_->SetRecordingDevice(c.win_type);
-      } else {
-        if (c.index < 0 || c.index >= refreshed_devices) {
-          std::cerr << "[pc] mic-test: skip invalid index " << c.index
-                    << " after refresh\n";
-          continue;
-        }
-        rc_set = adm_->SetRecordingDevice(static_cast<uint16_t>(c.index));
-      }
-      if (rc_set != 0) {
-        std::cerr << "[pc] mic-test: SetRecordingDevice failed on "
-                  << (c.kind == Candidate::Kind::kIndex ? "index " + std::to_string(c.index)
-                                                        : std::string(c.name))
-                  << "\n";
-        continue;
-      }
-      // 不主动调 InitMicrophone()。InitRecording() 内部会负责调用
-      // InitMicrophoneLocked() 并完成一致的初始化流程，避免重复初始化导致
-      // 设备集合状态异常。
-      if (adm_->InitRecording() != 0) {
-        std::cerr << "[pc] mic-test: InitRecording failed on "
-                  << (c.kind == Candidate::Kind::kIndex ? "index " + std::to_string(c.index)
-                                                        : std::string(c.name))
-                  << "\n";
-        continue;
-      }
-      if (adm_->StartRecording() != 0) {
-        // 某些 Windows 设备会走 built-in AEC 路径，要求先启动 playout。
-        bool started_playout_for_retry = false;
-        if (!adm_->Playing()) {
-          if (adm_->InitPlayout() == 0 && adm_->StartPlayout() == 0) {
-            started_playout_for_retry = true;
-            std::cerr << "[pc] mic-test: started playout fallback before retrying recording\n";
-          } else {
-            std::cerr << "[pc] mic-test: playout fallback init/start failed\n";
-          }
-        }
-        if (adm_->StartRecording() != 0) {
-          std::cerr << "[pc] mic-test: StartRecording failed on "
-                    << (c.kind == Candidate::Kind::kIndex ? "index " + std::to_string(c.index)
-                                                          : std::string(c.name))
-                    << "\n";
-          if (adm_->Recording()) {
-            adm_->StopRecording();
-          }
-          if (started_playout_for_retry && adm_->Playing()) {
-            adm_->StopPlayout();
-          }
-          continue;
-        }
-      }
-      std::cerr << "[pc] mic-test: recording started with "
-                << (c.kind == Candidate::Kind::kIndex ? "index " + std::to_string(c.index)
-                                                      : std::string(c.name))
-                << "\n";
-      ok = true;
-      return ok;
-    }
-
-    std::cerr << "[pc] StartRecording() failed on all candidates "
-                 "(tip: close apps occupying mic, check Windows microphone "
-                 "privacy permission, and verify input format in OS sound "
-                 "settings)\n";
-    ok = false;
-  }
-  return ok;
-}
-
-bool PeerConnectionClient::StopLocalCaptureSelfTest() {
-  if (!adm_) {
-    return false;
-  }
-  if (adm_->Recording()) {
-    adm_->StopRecording();
-  }
-  if (adm_->Playing()) {
-    adm_->StopPlayout();
-  }
-  return true;
-}
-
-void PeerConnectionClient::LogRecordingDevices() const {
-  if (!adm_) {
-    return;
-  }
-  if (adm_->Init() != 0) {
-    std::cerr << "[pc] ADM Init() failed in LogRecordingDevices\n";
-    return;
-  }
-  const int16_t num = adm_->RecordingDevices();
-  std::cerr << "[pc] recording devices: " << num << "\n";
-  for (int16_t i = 0; i < num; ++i) {
-    char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-    char guid[webrtc::kAdmMaxGuidSize] = {0};
-    if (adm_->RecordingDeviceName(i, name, guid) == 0) {
-      std::cerr << "  [" << i << "] " << name << "\n";
-    }
-  }
-}
-
 bool PeerConnectionClient::SetLocalAudioEnabled(bool enabled) {
+  // [L5] 讲话开关：确保录音线程可用，再切本地音轨 enabled 状态。
   std::lock_guard<std::mutex> lock(audio_mutex_);
   if (!local_audio_track_) {
     std::cerr << "[pc] local audio track not ready\n";
@@ -737,6 +567,7 @@ bool PeerConnectionClient::SetLocalAudioEnabled(bool enabled) {
 }
 
 bool PeerConnectionClient::CreateAnswer() {
+  // [L4] 协商链路（B）：收到 offer 后创建 answer。
   if (!pc_) return false;
   // B 端的 CreateAnswer。前提：已经 SetRemoteSdp(kOffer, ...) 过了。
   // 同样是异步，结果通过 OnLocalSdpReady 触发。
@@ -817,6 +648,7 @@ bool PeerConnectionClient::SendMessage(const std::string& text) {
 
 void PeerConnectionClient::OnLocalSdpReady(
     std::unique_ptr<webrtc::SessionDescriptionInterface> desc) {
+  // [L4] CreateOffer/Answer 异步完成后，设置本地描述并回调应用层发信令。
   // 走到这里表示 CreateOffer 或 CreateAnswer 异步完成了。
 
   // 拷一份信息出来，因为下一步 SetLocalDescription 会把 desc 的所有权拿走。
@@ -879,6 +711,7 @@ void PeerConnectionClient::OnDataChannel(
 
 void PeerConnectionClient::OnTrack(
     webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+  // [L6] 远端音轨到达：绑定 AudioSink，把 PCM 帧回调给应用层。
   if (!transceiver) {
     return;
   }

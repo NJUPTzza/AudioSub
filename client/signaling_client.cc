@@ -1,5 +1,3 @@
-// signaling_client.cc
-// ===================
 // 信令客户端的 Windows 实现，用 Winsock2 直接做阻塞式 TCP。
 //
 // 关键设计点：
@@ -16,6 +14,14 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+
+// 核心方法
+// Connect()                          入口方法，负责建立 TCP 连接、发送第一条 hello 、启动后台接收线程
+// Send()                             发送一条 JSON 消息给信令服务器，如 hello, offer, answer candidate
+// SetMessageHandler()                注册“收到服务器消息后该怎么处理”的回调
+// RecvLoop()                         后台线程，负责接收服务器消息、调用回调处理
+// DispatchLine()                     把收到的一行文本解析成 JSON，再调用前面注册的 handler, “网络字节流 -> 应用层消息”的最后一步
+// Close()                            关闭 TCP 连接，清理资源
 
 namespace audiosub {
 
@@ -71,6 +77,7 @@ SignalingClient::~SignalingClient() { Close(); }
 bool SignalingClient::Connect(const std::string& host,
                               int port,
                               const std::string& peer_id) {
+  // [L1] 连接链路：TCP connect -> hello -> 启动接收线程。
   EnsureWinsock();
 
   if (running_.load()) {
@@ -163,6 +170,7 @@ void SignalingClient::SetMessageHandler(MessageHandler handler) {
 }
 
 void SignalingClient::RecvLoop() {
+  // [L1] 接收链路：TCP 字节流 -> 按 '\n' 切行 -> JSON 解析 -> 回调应用层。
   // 行缓冲：TCP 是"字节流"，不保证 send 一次对应 recv 一次。可能：
   //   - 一次 recv 收到半条 + 一条完整 + 半条
   //   - 一条消息分多次 recv 才能收齐
@@ -203,6 +211,7 @@ void SignalingClient::RecvLoop() {
 }
 
 void SignalingClient::DispatchLine(const std::string& line) {
+  // [L1] 分发链路：解析一条 JSON 并转交给 main.cc 设置的 message handler。
   if (line.empty()) return;
 
   // nlohmann/json 默认遇错抛异常，但我们项目用 _HAS_EXCEPTIONS=0 关闭了

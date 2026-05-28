@@ -1,69 +1,16 @@
-// peer_connection_client.h
-// ========================
-// WebRTC PeerConnection 的高层封装。把 WebRTC 那一堆"线程 + 工厂 + Observer +
-// Promise 风格异步"的复杂 API 包装成 4 个高层方法 + 4 个回调，业务层（main.cc）
-// 不需要直接接触 WebRTC 的细节。
-//
-// ============================================================================
-// WebRTC 协商流程速览（你看代码前必须先理解的概念）
-// ============================================================================
-//
-// 角色：
-//   - Offerer (A 端)：主动发起连接的一方
-//   - Answerer (B 端)：应答的一方
-//
-// 完整握手时序：
-//
-//   A 端                          信令服务器                   B 端
-//   |                                |                          |
-//   |  CreateOffer()                 |                          |
-//   |  生成 SDP Offer                |                          |
-//   |---- {type:"offer", sdp} ---->  |                          |
-//   |                                |--- {type:"offer"} ---->  |
-//   |                                |                          | SetRemoteDescription(offer)
-//   |                                |                          | CreateAnswer()
-//   |                                |                          | 生成 SDP Answer
-//   |                                | <-- {type:"answer"} ---- |
-//   |  <-- {type:"answer"} ---       |                          |
-//   |  SetRemoteDescription(answer)  |                          |
-//   |                                |                          |
-//   |   ---- ICE candidates ----     |   --- ICE candidates --- |
-//   |   双向交换网络地址候选          |   服务器纯转发            |
-//   |                                |                          |
-//   |   ICE 协商完成（NAT 穿透）     |                          |
-//   |   DTLS 握手完成（加密）        |                          |
-//   |   <===== P2P 通道建立 =====>   |  ===================>    |
-//   |                                |                          |
-//   |   <----- DataChannel 上下行直接走 P2P，绕过服务器 ----->  |
-//
-// 关键名词：
-//   - SDP (Session Description Protocol)：一段文本，描述本端支持的编解码、
-//     ICE 凭证、媒体轨道等。Offer 和 Answer 都是 SDP。
-//   - ICE Candidate：一个"我可以在 IP:Port 这里被联系到"的候选地址。一端会
-//     生成多条 candidate（公网 IP、私网 IP、relay 等），通过信令交换给对端，
-//     最后两端各自选出一条能互通的 pair。
-//   - DTLS：在 UDP 上做 TLS，让 P2P 通道加密。WebRTC 内部自动处理。
-//   - DataChannel：基于 SCTP 的可靠/有序消息通道，类似 WebSocket，但走 P2P。
-//
-// ============================================================================
-// 本类对外接口
-// ============================================================================
-//
-// 4 个方法（由业务/信令侧调用）：
-//   Initialize()                  启动 3 个内部线程，创建 Factory + PeerConnection
-//   CreateOfferAndDataChannel()   A 端：开 channel + 创建 offer
-//   CreateAnswer()                B 端：收到 offer 后回 answer
-//   SetRemoteSdp() / AddRemoteIceCandidate()  接收对端 SDP / ICE
-//   SendMessage()                 通过 DataChannel 发文字（P2P 直连）
-//
-// 4 个回调（由本类异步触发，业务侧设置）：
-//   SdpReadyCallback        本端 SDP 生成好了，业务侧应该发给对端
-//   IceCandidateCallback    本端发现一个 ICE candidate，业务侧应该发给对端
-//   MessageCallback         对端通过 DataChannel 发来一条文字
-//   StateCallback           连接状态变化（信令/ICE/DataChannel 等）
-//
-// 业务层只要"按提示办事"：回调里说要送出什么，就通过信令送出。
-// ============================================================================
+// WebRTC PeerConnection 的高层封装
+
+// 核心方法
+// Initialize()                         初始化 WebRTC，创建线程、Factory、PeerConnection 等
+// CreateOfferAndDataChannel()          A 端发起协商，开 channel + 创建 offer
+// EnableLocalAudio()                   启用本地音频轨道，开始发送音频数据
+// SetLocalAudioEnabled()               控制语音讲话开关
+// CreateAnswer()                       B 端收到 offer 后， 生成 answer 并回 channel
+// SetRemoteSdp()                       接收对端 SDP / ICE
+// AddRemoteIceCandidate()              接收对端 ICE candidate
+// SendMessage()                        通过 DataChannel 发文字（P2P 直连）
+
+
 
 #pragma once
 
@@ -73,7 +20,7 @@
 #include <mutex>
 #include <string>
 
-#include "audiosub/core/types.h"
+#include "core/types.h"
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
 #include "api/peer_connection_interface.h"
@@ -148,22 +95,6 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // true  表示 A 端开始讲话；
   // false 表示 A 端结束讲话（轨道仍保留，但发送静音）。
   bool SetLocalAudioEnabled(bool enabled);
-
-  // === 麦克风自测（独立于 PeerConnection 协商）===
-  //
-  // 用途：在没有 B 端、没有 SDP/ICE 协商的情况下，验证"麦克风到底能不能
-  // 被本进程采集到"。WebRTC 默认要等 AudioSendStream 激活才会启动 ADM，
-  // 因此即便 EnableLocalAudio() + SetLocalAudioEnabled(true) 在本地也不
-  // 会触发 OnCaptureData。这两个方法显式地把 ADM 的录音生命周期拉起，让
-  // AdmCaptureObserver 立刻开始往业务侧投递 PCM。
-  //
-  // 调用前提：Initialize() 已经成功，ADM 已经创建好。
-  // 也可以在普通 A 端流程里调用，用于"提前 warm-up 一下 ADM"。
-  bool StartLocalCaptureSelfTest();
-  bool StopLocalCaptureSelfTest();
-
-  // 把当前进程能看到的录音设备打印到 stderr，仅诊断用。
-  void LogRecordingDevices() const;
 
   // B 端入口：在 SetRemoteSdp(kOffer, ...) 之后调用，生成 Answer。
   // Answer 生成完通过 SdpReadyCallback 通知。

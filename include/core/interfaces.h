@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include "audiosub/core/types.h"
+#include "core/types.h"
 
 namespace audiosub::core {
 

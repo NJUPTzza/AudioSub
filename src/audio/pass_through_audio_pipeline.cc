@@ -1,4 +1,4 @@
-#include "audiosub/audio/pass_through_audio_pipeline.h"
+#include "audio/pass_through_audio_pipeline.h"
 
 namespace audiosub::audio {
 
