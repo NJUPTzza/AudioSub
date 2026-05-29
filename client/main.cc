@@ -12,8 +12,14 @@
 //                                                              ↓ P2P
 //   B端: PeerConnection → AudioTrack → RemoteAudioSink::OnData()
 //              → PcmFrame → PcmRingBuffer → 打印线程
+//
+// 退出机制:
+//   - 用户输入 /quit
+//   - 对端离线（收到 peer_left 信令）
+//   - WebRTC 连接断开（pc:disconnected / pc:failed / pc:closed）
 
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -42,7 +48,7 @@ void PrintUsage(const char* prog) {
       << "  A: offerer (creates AudioTrack, sends Offer)\n"
       << "  B: answerer (waits for Offer, receives audio)\n"
       << "\n"
-      << "Type /quit to exit.\n";
+      << "Type /quit to exit. Program also exits when peer disconnects.\n";
 }
 
 struct Args {
@@ -103,13 +109,12 @@ int main(int argc, char** argv) {
   }
 
   // === Step 2: Set up audio pipeline ===
-  // A端: add audio track for microphone capture
-  // B端: set up audio receive pipeline (RingBuffer + Sink + print thread)
   std::unique_ptr<audiosub::audio::PcmRingBuffer> ring_buffer;
   std::unique_ptr<audiosub::RemoteAudioSink> remote_sink;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track;
   std::thread audio_print_thread;
   std::atomic<bool> audio_running{false};
+  std::atomic<bool> should_exit{false};
 
   if (is_offerer) {
     if (!pc.AddAudioTrack()) {
@@ -177,13 +182,21 @@ int main(int argc, char** argv) {
         signaling.Send(msg);
       });
 
-  pc.SetStateCallback([](const std::string& state) {
+  pc.SetStateCallback([&](const std::string& state) {
     Println(std::string("[state] ") + state);
+    if (state == "pc:disconnected" || state == "pc:failed" ||
+        state == "pc:closed") {
+      Println("[pc] peer connection lost, exiting...");
+      should_exit = true;
+      audio_running = false;
+      if (ring_buffer) ring_buffer->Close();
+    }
   });
 
   // === Step 4: Wire signaling callbacks to WebRTC ===
   signaling.SetMessageHandler(
-      [&pc, is_offerer](const nlohmann::json& msg) {
+      [&pc, is_offerer, &should_exit, &ring_buffer, &audio_running](
+          const nlohmann::json& msg) {
         std::string type = msg.value("type", "");
 
         if (type == "peer_ready") {
@@ -195,7 +208,11 @@ int main(int argc, char** argv) {
           }
 
         } else if (type == "peer_left") {
-          Println(std::string("[peer] ") + msg.value("peer", "?") + " left");
+          Println(std::string("[peer] ") + msg.value("peer", "?") +
+                  " left, exiting...");
+          should_exit = true;
+          audio_running = false;
+          if (ring_buffer) ring_buffer->Close();
 
         } else if (type == "offer") {
           Println("[pc] received Offer from peer");
@@ -225,14 +242,26 @@ int main(int argc, char** argv) {
             << "\n"
             << "Waiting for peer. Once both peers are online, the offerer "
                "will start.\n"
-            << "Type /quit to exit.\n"
+            << "Type /quit to exit. Program also exits when peer disconnects.\n"
             << "> " << std::flush;
 
-  // === Step 6: Wait for /quit ===
-  std::string line;
-  while (std::getline(std::cin, line)) {
-    if (line == "/quit" || line == "/exit") break;
-    std::cout << "> " << std::flush;
+  // === Step 6: stdin reader thread + main wait loop ===
+  // stdin reading must be on a separate thread because getline blocks.
+  // Main thread polls should_exit flag (set by peer_left / connection lost).
+  std::thread stdin_thread([&]() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+      if (line == "/quit" || line == "/exit") {
+        should_exit = true;
+        break;
+      }
+      std::lock_guard<std::mutex> lock(g_print_mutex);
+      std::cout << "> " << std::flush;
+    }
+  });
+
+  while (!should_exit.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
   // === Step 7: Cleanup ===
@@ -243,8 +272,12 @@ int main(int argc, char** argv) {
   audio_running = false;
   if (ring_buffer) ring_buffer->Close();
   if (audio_print_thread.joinable()) audio_print_thread.join();
+
   signaling.Close();
   pc.Close();
+
+  if (stdin_thread.joinable()) stdin_thread.detach();
+
   std::cout << "bye.\n";
   return 0;
 }
