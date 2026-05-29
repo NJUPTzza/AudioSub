@@ -17,6 +17,8 @@
 #include "api/create_peerconnection_factory.h"
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
+#include "api/audio_options.h"
+#include "api/media_stream_interface.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/ssl_adapter.h"
 
@@ -238,24 +240,22 @@ bool PeerConnectionClient::Initialize() {
 }
 
 void PeerConnectionClient::Close() {
-  // 关闭顺序很重要：DataChannel -> PeerConnection -> Factory -> 线程
-  // 反过来会出问题（线程停了之后 PeerConnection 析构会卡）。
-
   {
     std::lock_guard<std::mutex> lock(dc_mutex_);
     if (dc_) {
-      dc_->UnregisterObserver();  // 一定要先注销 observer，否则析构时回调到野指针
+      dc_->UnregisterObserver();
       dc_->Close();
       dc_ = nullptr;
     }
   }
+  audio_track_ = nullptr;
+  audio_source_ = nullptr;
   if (pc_) {
     pc_->Close();
     pc_ = nullptr;
   }
   factory_ = nullptr;
 
-  // 停三个内部线程。注意 reset 之前要 Stop()，让线程退出事件循环。
   if (signaling_thread_) signaling_thread_->Stop();
   if (worker_thread_) worker_thread_->Stop();
   if (network_thread_) network_thread_->Stop();
@@ -343,7 +343,6 @@ bool PeerConnectionClient::AddRemoteIceCandidate(const std::string& sdp_mid,
 }
 
 bool PeerConnectionClient::SendMessage(const std::string& text) {
-  // 拿一份 dc_ 的快照（多线程下避免长时间持锁）。
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc;
   {
     std::lock_guard<std::mutex> lock(dc_mutex_);
@@ -353,7 +352,6 @@ bool PeerConnectionClient::SendMessage(const std::string& text) {
     std::cerr << "[pc] no data channel yet\n";
     return false;
   }
-  // 必须是 open 状态才能发。kConnecting 时 send 会被丢弃。
   if (dc->state() != webrtc::DataChannelInterface::kOpen) {
     std::cerr << "[pc] data channel not open (state="
               << webrtc::DataChannelInterface::DataStateString(dc->state())
@@ -361,10 +359,38 @@ bool PeerConnectionClient::SendMessage(const std::string& text) {
     return false;
   }
 
-  // DataBuffer(string) 会构造一个 binary=false 的"文字"buffer。对端 OnMessage
-  // 收到时也会知道这是文字。
   webrtc::DataBuffer buf(text);
   return dc->Send(buf);
+}
+
+bool PeerConnectionClient::AddAudioTrack() {
+  if (!pc_ || !factory_) return false;
+
+  webrtc::AudioOptions options;
+  audio_source_ = factory_->CreateAudioSource(options);
+  if (!audio_source_) {
+    std::cerr << "[pc] CreateAudioSource failed\n";
+    return false;
+  }
+
+  audio_track_ =
+      factory_->CreateAudioTrack("audio_label", audio_source_.get());
+  if (!audio_track_) {
+    std::cerr << "[pc] CreateAudioTrack failed\n";
+    audio_source_ = nullptr;
+    return false;
+  }
+
+  auto result = pc_->AddTrack(audio_track_, {"stream_id"});
+  if (!result.ok()) {
+    std::cerr << "[pc] AddTrack failed: " << result.error().message() << "\n";
+    audio_track_ = nullptr;
+    audio_source_ = nullptr;
+    return false;
+  }
+
+  RTC_LOG(LS_INFO) << "[pc] audio track added";
+  return true;
 }
 
 // ===========================================================================
@@ -415,10 +441,20 @@ void PeerConnectionClient::OnSignalingChange(
 
 void PeerConnectionClient::OnDataChannel(
     webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) {
-  // B 端：A 端创建的 DataChannel 通过 SDP 协商后，在这里到达本端。
-  // 我们立刻 Attach（注册 observer + 保存指针）。
   RTC_LOG(LS_INFO) << "[pc] OnDataChannel: " << data_channel->label();
   AttachDataChannel(std::move(data_channel));
+}
+
+void PeerConnectionClient::OnTrack(
+    webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+  if (!transceiver) return;
+  auto track = transceiver->receiver()->track();
+  if (track && track->kind() == webrtc::MediaStreamTrackInterface::kAudioKind) {
+    auto* audio_track =
+        static_cast<webrtc::AudioTrackInterface*>(track.get());
+    RTC_LOG(LS_INFO) << "[pc] OnTrack: remote audio track received";
+    if (audio_track_cb_) audio_track_cb_(audio_track);
+  }
 }
 
 void PeerConnectionClient::OnIceGatheringChange(

@@ -1,45 +1,30 @@
 // main.cc
 // =======
-// audiosub_client.exe 的入口。这个文件做的事：
-//   1. 解析命令行 --id A/B、--host、--port
-//   2. 创建 PeerConnectionClient + SignalingClient
-//   3. 把"WebRTC 生成的 SDP/ICE"转发到信令通道
-//      把"信令通道收到的 SDP/ICE"喂回 WebRTC
-//   4. 主线程跑 std::getline 读用户输入，调 SendMessage 发到 P2P
+// audiosub_client.exe 的入口。
 //
-// 这里就是阶段 1b 的全部业务逻辑——大约 100 行。
+// Stage 2: WebRTC 音频链路
+//   A端: 麦克风采集 → AudioTrack → WebRTC P2P → B端
+//   B端: AudioTrackSink → PcmRingBuffer → 控制台打印PCM帧信息
 //
-// 流程示意：
+// 数据流:
 //
-//   stdin (用户输入)                stdout (打印)
-//        |                              ^
-//        v                              |
-//   ┌────────────────────────────────────────┐
-//   │ main 主线程：getline 循环              │
-//   │   收到字符串 -> pc.SendMessage()       │
-//   └────────────────────────────────────────┘
-//                  |   ^
-//                  v   |   (P2P 数据)
-//   ┌──────────────────────────────────────────┐
-//   │ PeerConnectionClient (内部 3 线程)       │
-//   └──────────────────────────────────────────┘
-//      ^回调                  | 回调
-//      | SDP/ICE              v
-//   ┌──────────────────────────────────────────┐
-//   │ SignalingClient (1 后台 recv 线程)        │
-//   └──────────────────────────────────────────┘
-//          ^                      |
-//          | TCP/JSON 上行         v 下行
-//          +---- 信令服务器 -------+
+//   A端: 麦克风 → ADM → AudioSource → AudioTrack → PeerConnection
+//                                                              ↓ P2P
+//   B端: PeerConnection → AudioTrack → RemoteAudioSink::OnData()
+//              → PcmFrame → PcmRingBuffer → 打印线程
 
 #include <atomic>
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
+#include "api/media_stream_interface.h"
+#include "audiosub/audio/pcm_ring_buffer.h"
 #include "peer_connection_client.h"
+#include "remote_audio_sink.h"
 #include "signaling_client.h"
 
 namespace {
@@ -49,24 +34,23 @@ void PrintUsage(const char* prog) {
       << "Usage: " << prog
       << " --id <A|B> [--host 127.0.0.1] [--port 8888]\n"
       << "\n"
-      << "Stage 1b demo: two peers establish a WebRTC DataChannel through\n"
-      << "the signaling server, then exchange text messages over P2P.\n"
+      << "Stage 2: WebRTC audio link demo.\n"
+      << "  A: captures microphone audio and sends via WebRTC\n"
+      << "  B: receives audio, prints PCM frame info to console\n"
       << "\n"
       << "Role:\n"
-      << "  A: offerer (creates DataChannel and sends Offer)\n"
-      << "  B: answerer (waits for Offer, then sends Answer)\n"
+      << "  A: offerer (creates DataChannel + AudioTrack, sends Offer)\n"
+      << "  B: answerer (waits for Offer, receives audio)\n"
       << "\n"
-      << "Type any text + Enter to send. /quit to exit.\n";
+      << "Type any text + Enter to send over DataChannel. /quit to exit.\n";
 }
 
-// 命令行参数。--id 必填。
 struct Args {
-  std::string id;            // "A" 或 "B"
+  std::string id;
   std::string host = "127.0.0.1";
   int port = 8888;
 };
 
-// 简易命令行解析：循环识别 --xxx <value>，碰到 -h/--help 返回 false 触发用法说明。
 bool ParseArgs(int argc, char** argv, Args* out) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -93,9 +77,6 @@ bool ParseArgs(int argc, char** argv, Args* out) {
   return !out->id.empty();
 }
 
-// 控制台多线程打印很容易把"[you]"提示行打乱。这里加锁保证：
-//   - 一行消息原子打印
-//   - 总是补回 "[you] " 提示行（用 \r 回到行首再覆盖）
 std::mutex g_print_mutex;
 
 void Println(const std::string& s) {
@@ -112,23 +93,70 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // 角色判定：本项目约定 A 是 offerer，B 是 answerer。
-  // 这只是一个客户端层面的约定，信令服务器不关心谁先发 offer。
   const bool is_offerer = (args.id == "A");
 
-  // === 第 1 步：先把 WebRTC 准备好（启动线程 + 创建 PeerConnection）===
+  // === Step 1: Initialize WebRTC ===
   audiosub::PeerConnectionClient pc;
   if (!pc.Initialize()) {
     std::cerr << "PeerConnectionClient::Initialize() failed\n";
     return 2;
   }
 
+  // === Step 2: Set up audio pipeline ===
+  // A端: add audio track for microphone capture
+  // B端: set up audio receive pipeline (RingBuffer + Sink + print thread)
+  std::unique_ptr<audiosub::audio::PcmRingBuffer> ring_buffer;
+  std::unique_ptr<audiosub::RemoteAudioSink> remote_sink;
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track;
+  std::thread audio_print_thread;
+  std::atomic<bool> audio_running{false};
+
+  if (is_offerer) {
+    if (!pc.AddAudioTrack()) {
+      std::cerr << "AddAudioTrack() failed\n";
+      return 2;
+    }
+    Println("[audio] microphone audio track added (A)");
+  } else {
+    ring_buffer = std::make_unique<audiosub::audio::PcmRingBuffer>(200);
+    remote_sink =
+        std::make_unique<audiosub::RemoteAudioSink>(*ring_buffer);
+
+    pc.SetAudioTrackCallback([&](webrtc::AudioTrackInterface* track) {
+      remote_audio_track = track;
+      track->AddSink(remote_sink.get());
+      Println("[audio] remote audio track received, sink attached (B)");
+    });
+
+    audio_running = true;
+    audio_print_thread = std::thread([&]() {
+      int64_t frame_count = 0;
+      while (audio_running.load()) {
+        auto frame = ring_buffer->WaitPop();
+        if (!frame) break;
+        frame_count++;
+        if (frame_count <= 5 || frame_count % 100 == 0) {
+          double duration_ms =
+              static_cast<double>(frame->samples.size() / frame->channels) *
+              1000.0 / frame->sample_rate;
+          Println("[audio] frame #" + std::to_string(frame_count) +
+                  ": " + std::to_string(frame->sample_rate) + "Hz " +
+                  std::to_string(frame->channels) + "ch " +
+                  std::to_string(frame->samples.size()) + "samples " +
+                  "ts=" + std::to_string(frame->timestamp_ms) + "ms " +
+                  "(" + std::to_string(duration_ms).substr(0, 5) +
+                  "ms/frame)");
+        }
+      }
+      Println("[audio] print thread stopped, total frames: " +
+              std::to_string(frame_count));
+    });
+  }
+
   audiosub::SignalingClient signaling;
 
-  // === 第 2 步：把 WebRTC 的 4 个回调接到"通过信令送出"或"打到控制台"===
+  // === Step 3: Wire WebRTC callbacks to signaling ===
 
-  // 本端 SDP 生成完成 -> 通过信令送给对端。
-  // type 是 kOffer 或 kAnswer，根据当前角色而定。
   pc.SetSdpReadyCallback(
       [&signaling](webrtc::SdpType type, const std::string& sdp) {
         std::string type_str =
@@ -139,8 +167,6 @@ int main(int argc, char** argv) {
                 std::to_string(sdp.size()) + " bytes)");
       });
 
-  // 发现一个本端 ICE candidate -> 也送给对端。
-  // 注意 sdpMid 和 sdpMLineIndex 必须原样回传，对端解析时要用。
   pc.SetIceCandidateCallback(
       [&signaling](const std::string& candidate, const std::string& mid,
                    int mline) {
@@ -151,49 +177,40 @@ int main(int argc, char** argv) {
         signaling.Send(msg);
       });
 
-  // P2P 通道上收到对端文字 -> 直接打印到控制台。
   pc.SetMessageCallback([](const std::string& text) {
     Println(std::string("<peer> ") + text);
   });
 
-  // 各种状态变化 -> 打印。仅辅助调试，不影响业务。
   pc.SetStateCallback([](const std::string& state) {
     Println(std::string("[state] ") + state);
   });
 
-  // === 第 3 步：把信令的回调接到"喂给 WebRTC"或"决定下一步动作"===
+  // === Step 4: Wire signaling callbacks to WebRTC ===
   signaling.SetMessageHandler(
       [&pc, is_offerer](const nlohmann::json& msg) {
         std::string type = msg.value("type", "");
 
         if (type == "peer_ready") {
-          // 对端上线。A 端在这一刻"主动发起"：创建 DataChannel + Offer。
           Println(std::string("[peer] ") + msg.value("peer", "?") +
                   " is online");
           if (is_offerer) {
             Println("[pc] creating Offer + DataChannel...");
             pc.CreateOfferAndDataChannel();
           }
-          // B 端不主动做任何事，等收到 offer。
 
         } else if (type == "peer_left") {
           Println(std::string("[peer] ") + msg.value("peer", "?") + " left");
 
         } else if (type == "offer") {
-          // B 端收到 A 端的 Offer：
-          //   先把 offer 设置为远端描述（这一步会触发 OnDataChannel）
-          //   再调 CreateAnswer 生成应答
           Println("[pc] received Offer from peer");
           pc.SetRemoteSdp(webrtc::SdpType::kOffer, msg.value("sdp", ""));
           pc.CreateAnswer();
 
         } else if (type == "answer") {
-          // A 端收到 B 端的 Answer：设置为远端描述就行，握手完成。
           Println("[pc] received Answer from peer");
           pc.SetRemoteSdp(webrtc::SdpType::kAnswer, msg.value("sdp", ""));
 
         } else if (type == "candidate") {
-          // 收到对端的 ICE candidate：直接喂给 WebRTC。
           pc.AddRemoteIceCandidate(msg.value("sdpMid", ""),
                                    msg.value("sdpMLineIndex", 0),
                                    msg.value("candidate", ""));
@@ -203,22 +220,19 @@ int main(int argc, char** argv) {
         }
       });
 
-  // === 第 4 步：连接信令服务器 ===
-  // 这一步会发出 hello。如果对端已经在线，会立刻收到 peer_ready，触发上面
-  // 的逻辑去 CreateOffer / 等待 offer。
+  // === Step 5: Connect to signaling server ===
   if (!signaling.Connect(args.host, args.port, args.id)) {
     return 3;
   }
 
-  std::cout << "Role: " << (is_offerer ? "A (offerer)" : "B (answerer)")
+  std::cout << "Role: " << (is_offerer ? "A (offerer, mic capture)" : "B (answerer, audio receive)")
             << "\n"
             << "Waiting for peer. Once both peers are online, the offerer "
                "will start.\n"
             << "Type messages and Enter to send. /quit to exit.\n"
             << "[you] " << std::flush;
 
-  // === 第 5 步：主线程进入 stdin 读循环 ===
-  // 用户每输一行就尝试通过 DataChannel 发出。dc 没 open 之前会被拒绝。
+  // === Step 6: Main loop (stdin) ===
   std::string line;
   while (std::getline(std::cin, line)) {
     if (line == "/quit" || line == "/exit") break;
@@ -233,8 +247,14 @@ int main(int argc, char** argv) {
     }
   }
 
-  // === 第 6 步：清理 ===
-  // 注意顺序：先关信令（这样不会再有新 SDP/ICE 进来），再关 WebRTC（停所有线程）。
+  // === Step 7: Cleanup ===
+  if (remote_audio_track) {
+    remote_audio_track->RemoveSink(remote_sink.get());
+    remote_audio_track = nullptr;
+  }
+  audio_running = false;
+  if (ring_buffer) ring_buffer->Close();
+  if (audio_print_thread.joinable()) audio_print_thread.join();
   signaling.Close();
   pc.Close();
   std::cout << "bye.\n";

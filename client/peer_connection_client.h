@@ -75,6 +75,7 @@
 
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
+#include "api/media_stream_interface.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
@@ -109,6 +110,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 仅用于打印/UI 显示，不影响逻辑。
   using StateCallback = std::function<void(const std::string& state)>;
 
+  using AudioTrackCallback = std::function<void(webrtc::AudioTrackInterface* track)>;
+
   PeerConnectionClient();
   ~PeerConnectionClient() override;
 
@@ -139,6 +142,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 通过 DataChannel 发送文字。返回 false 表示 channel 还没 open。
   bool SendMessage(const std::string& text);
 
+  bool AddAudioTrack();
+
   // 优雅关闭：停掉所有线程、释放 WebRTC 资源。析构时也会自动调用。
   void Close();
 
@@ -148,6 +153,7 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   void SetIceCandidateCallback(IceCandidateCallback cb) { ice_cb_ = std::move(cb); }
   void SetMessageCallback(MessageCallback cb) { message_cb_ = std::move(cb); }
   void SetStateCallback(StateCallback cb) { state_cb_ = std::move(cb); }
+  void SetAudioTrackCallback(AudioTrackCallback cb) { audio_track_cb_ = std::move(cb); }
 
   // === PeerConnectionObserver 接口实现（WebRTC 触发） ===
   // 这些方法都是 WebRTC 内部线程回调过来的，不能阻塞太久。
@@ -163,6 +169,9 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
 
   // 协商需要重新走一遍（比如改了媒体配置）。我们暂时不处理。
   void OnRenegotiationNeeded() override {}
+
+  void OnTrack(
+      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
 
   // ICE 候选收集状态变化（new / gathering / complete）
   void OnIceGatheringChange(
@@ -238,6 +247,10 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   IceCandidateCallback ice_cb_;
   MessageCallback message_cb_;
   StateCallback state_cb_;
+  AudioTrackCallback audio_track_cb_;
+
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> audio_track_;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> audio_source_;
 };
 
 }  // namespace audiosub
