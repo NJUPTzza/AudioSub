@@ -2,7 +2,7 @@
 // =======
 // audiosub_client.exe 的入口。
 //
-// Stage 2: WebRTC 音频链路（纯音频，无文字通信）
+// Stage 2: WebRTC 音频链路
 //   A端: 麦克风采集 → AudioTrack → WebRTC P2P → B端
 //   B端: AudioTrackSink → PcmRingBuffer → 控制台打印PCM帧信息
 //
@@ -34,15 +34,15 @@ void PrintUsage(const char* prog) {
       << "Usage: " << prog
       << " --id <A|B> [--host 127.0.0.1] [--port 8888]\n"
       << "\n"
-      << "Stage 2: WebRTC audio link demo (audio only, no text chat).\n"
+      << "Stage 2: WebRTC audio link demo.\n"
       << "  A: captures microphone audio and sends via WebRTC\n"
       << "  B: receives audio, prints PCM frame info to console\n"
       << "\n"
       << "Role:\n"
-      << "  A: offerer (creates AudioTrack, sends Offer)\n"
+      << "  A: offerer (creates DataChannel + AudioTrack, sends Offer)\n"
       << "  B: answerer (waits for Offer, receives audio)\n"
       << "\n"
-      << "Type /quit to exit.\n";
+      << "Type any text + Enter to send over DataChannel. /quit to exit.\n";
 }
 
 struct Args {
@@ -81,7 +81,7 @@ std::mutex g_print_mutex;
 
 void Println(const std::string& s) {
   std::lock_guard<std::mutex> lock(g_print_mutex);
-  std::cout << "\r" << s << "\n> " << std::flush;
+  std::cout << "\r" << s << "\n[you] " << std::flush;
 }
 
 }  // namespace
@@ -177,6 +177,10 @@ int main(int argc, char** argv) {
         signaling.Send(msg);
       });
 
+  pc.SetMessageCallback([](const std::string& text) {
+    Println(std::string("<peer> ") + text);
+  });
+
   pc.SetStateCallback([](const std::string& state) {
     Println(std::string("[state] ") + state);
   });
@@ -225,14 +229,22 @@ int main(int argc, char** argv) {
             << "\n"
             << "Waiting for peer. Once both peers are online, the offerer "
                "will start.\n"
-            << "Type /quit to exit.\n"
-            << "> " << std::flush;
+            << "Type messages and Enter to send. /quit to exit.\n"
+            << "[you] " << std::flush;
 
-  // === Step 6: Wait for /quit ===
+  // === Step 6: Main loop (stdin) ===
   std::string line;
   while (std::getline(std::cin, line)) {
     if (line == "/quit" || line == "/exit") break;
-    std::cout << "> " << std::flush;
+    if (line.empty()) {
+      std::cout << "[you] " << std::flush;
+      continue;
+    }
+    if (!pc.SendMessage(line)) {
+      Println("(message dropped: data channel not open yet)");
+    } else {
+      std::cout << "[you] " << std::flush;
+    }
   }
 
   // === Step 7: Cleanup ===
