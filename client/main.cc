@@ -2,16 +2,19 @@
 // =======
 // audiosub_client.exe 的入口。
 //
-// Stage 2: WebRTC 音频链路（纯音频，无文字通信）
+// Stage 3: WebRTC 音频链路 + 音频处理
 //   A端: 麦克风采集 → AudioTrack → WebRTC P2P → B端
-//   B端: AudioTrackSink → PcmRingBuffer → 控制台打印PCM帧信息
+//   B端: AudioTrackSink → PcmRingBuffer → AudioPipeline(重采样+声道转换)
+//              → 控制台打印转换后PCM帧信息
 //
 // 数据流:
 //
 //   A端: 麦克风 → ADM → AudioSource → AudioTrack → PeerConnection
 //                                                              ↓ P2P
 //   B端: PeerConnection → AudioTrack → RemoteAudioSink::OnData()
-//              → PcmFrame → PcmRingBuffer → 打印线程
+//              → PcmFrame(48kHz/stereo) → PcmRingBuffer
+//              → AudioPipeline(48kHz→16kHz, stereo→mono)
+//              → PcmFrame(16kHz/mono) → 打印线程
 //
 // 退出机制:
 //   - 用户输入 /quit
@@ -28,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include "api/media_stream_interface.h"
+#include "audiosub/audio/audio_pipeline.h"
 #include "audiosub/audio/pcm_ring_buffer.h"
 #include "peer_connection_client.h"
 #include "remote_audio_sink.h"
@@ -40,13 +44,13 @@ void PrintUsage(const char* prog) {
       << "Usage: " << prog
       << " --id <A|B> [--host 127.0.0.1] [--port 8888]\n"
       << "\n"
-      << "Stage 2: WebRTC audio link demo (audio only, no text chat).\n"
+      << "Stage 3: WebRTC audio link + audio processing.\n"
       << "  A: captures microphone audio and sends via WebRTC\n"
-      << "  B: receives audio, prints PCM frame info to console\n"
+      << "  B: receives audio, resamples to 16kHz/mono, prints PCM info\n"
       << "\n"
       << "Role:\n"
       << "  A: offerer (creates AudioTrack, sends Offer)\n"
-      << "  B: answerer (waits for Offer, receives audio)\n"
+      << "  B: answerer (waits for Offer, receives + processes audio)\n"
       << "\n"
       << "Type /quit to exit. Program also exits when peer disconnects.\n";
 }
@@ -109,8 +113,11 @@ int main(int argc, char** argv) {
   }
 
   // === Step 2: Set up audio pipeline ===
+  // A端: add audio track for microphone capture
+  // B端: RingBuffer → AudioPipeline(48kHz→16kHz, stereo→mono) → print thread
   std::unique_ptr<audiosub::audio::PcmRingBuffer> ring_buffer;
   std::unique_ptr<audiosub::RemoteAudioSink> remote_sink;
+  std::unique_ptr<audiosub::audio::AudioPipeline> pipeline;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track;
   std::thread audio_print_thread;
   std::atomic<bool> audio_running{false};
@@ -126,6 +133,7 @@ int main(int argc, char** argv) {
     ring_buffer = std::make_unique<audiosub::audio::PcmRingBuffer>(200);
     remote_sink =
         std::make_unique<audiosub::RemoteAudioSink>(*ring_buffer);
+    pipeline = std::make_unique<audiosub::audio::AudioPipeline>(16000, 1);
 
     pc.SetAudioTrackCallback([&](webrtc::AudioTrackInterface* track) {
       remote_audio_track = track;
@@ -134,28 +142,36 @@ int main(int argc, char** argv) {
     });
 
     audio_running = true;
-    audio_print_thread = std::thread([&]() {
-      int64_t frame_count = 0;
-      while (audio_running.load()) {
-        auto frame = ring_buffer->WaitPop();
-        if (!frame) break;
-        frame_count++;
-        if (frame_count <= 5 || frame_count % 100 == 0) {
-          double duration_ms =
-              static_cast<double>(frame->samples.size() / frame->channels) *
-              1000.0 / frame->sample_rate;
-          Println("[audio] frame #" + std::to_string(frame_count) +
-                  ": " + std::to_string(frame->sample_rate) + "Hz " +
-                  std::to_string(frame->channels) + "ch " +
-                  std::to_string(frame->samples.size()) + "samples " +
-                  "ts=" + std::to_string(frame->timestamp_ms) + "ms " +
-                  "(" + std::to_string(duration_ms).substr(0, 5) +
-                  "ms/frame)");
-        }
-      }
-      Println("[audio] print thread stopped, total frames: " +
-              std::to_string(frame_count));
-    });
+    audio_print_thread = std::thread(
+        [&ring_buffer, &pipeline, &audio_running]() {
+          int64_t frame_count = 0;
+          while (audio_running.load()) {
+            auto frame = ring_buffer->WaitPop();
+            if (!frame) break;
+
+            auto converted = pipeline->resampler().Process(*frame);
+
+            frame_count++;
+            if (frame_count <= 5 || frame_count % 100 == 0) {
+              int out_frames = static_cast<int>(converted.samples.size()) /
+                               converted.channels;
+              double duration_ms =
+                  static_cast<double>(out_frames) * 1000.0 /
+                  converted.sample_rate;
+              Println("[audio] frame #" + std::to_string(frame_count) +
+                      ": " + std::to_string(frame->sample_rate) + "Hz/" +
+                      std::to_string(frame->channels) + "ch -> " +
+                      std::to_string(converted.sample_rate) + "Hz/" +
+                      std::to_string(converted.channels) + "ch " +
+                      std::to_string(converted.samples.size()) + "samples " +
+                      "ts=" + std::to_string(converted.timestamp_ms) + "ms " +
+                      "(" + std::to_string(duration_ms).substr(0, 5) +
+                      "ms/frame)");
+            }
+          }
+          Println("[audio] print thread stopped, total frames: " +
+                  std::to_string(frame_count));
+        });
   }
 
   audiosub::SignalingClient signaling;
@@ -238,7 +254,7 @@ int main(int argc, char** argv) {
     return 3;
   }
 
-  std::cout << "Role: " << (is_offerer ? "A (offerer, mic capture)" : "B (answerer, audio receive)")
+  std::cout << "Role: " << (is_offerer ? "A (offerer, mic capture)" : "B (answerer, audio receive + resample)")
             << "\n"
             << "Waiting for peer. Once both peers are online, the offerer "
                "will start.\n"
@@ -246,8 +262,6 @@ int main(int argc, char** argv) {
             << "> " << std::flush;
 
   // === Step 6: stdin reader thread + main wait loop ===
-  // stdin reading must be on a separate thread because getline blocks.
-  // Main thread polls should_exit flag (set by peer_left / connection lost).
   std::thread stdin_thread([&]() {
     std::string line;
     while (std::getline(std::cin, line)) {
