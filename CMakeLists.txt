@@ -97,7 +97,6 @@ target_include_directories(audiosub_core INTERFACE
 
 add_library(audiosub_audio STATIC
     "${CMAKE_SOURCE_DIR}/src/audio/pcm_ring_buffer.cc"
-    "${CMAKE_SOURCE_DIR}/src/audio/pass_through_audio_pipeline.cc"
     "${CMAKE_SOURCE_DIR}/src/audio/audio_resampler.cc"
     "${CMAKE_SOURCE_DIR}/src/audio/audio_pipeline.cc"
 )
@@ -124,7 +123,6 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/whisper.cpp" whisper.cpp)
 
 add_library(audiosub_asr STATIC
-    "${CMAKE_SOURCE_DIR}/src/asr/null_asr_engine.cc"
     "${CMAKE_SOURCE_DIR}/src/asr/whisper_asr_engine.cc"
 )
 add_library(audiosub::asr ALIAS audiosub_asr)
