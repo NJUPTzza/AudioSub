@@ -14,7 +14,7 @@ WhisperASREngine::WhisperASREngine(const std::string& model_path,
     : model_path_(model_path),
       language_(language),
       chunk_duration_ms_(chunk_duration_ms),
-      chunk_samples_(WHISPER_SAMPLE_RATE * chunk_duration_ms / 1000) {}
+      chunk_samples_(16000 * chunk_duration_ms / 1000) {}
 
 WhisperASREngine::~WhisperASREngine() {
   Stop();
@@ -60,6 +60,12 @@ void WhisperASREngine::PushAudio(const core::PcmFrame& frame) {
     }
     audio_buffer_.insert(audio_buffer_.end(), float_samples.begin(),
                          float_samples.end());
+    if (static_cast<int>(audio_buffer_.size()) > kMaxBufferSamples) {
+      int excess = static_cast<int>(audio_buffer_.size()) - kMaxBufferSamples;
+      audio_buffer_.erase(audio_buffer_.begin(),
+                          audio_buffer_.begin() + excess);
+      buffer_start_ms_ += excess * 1000 / 16000;
+    }
   }
 
   wake_cv_.notify_one();
@@ -99,8 +105,6 @@ void WhisperASREngine::WorkerLoop() {
       });
     }
 
-    if (!running_ && audio_buffer_.empty()) break;
-
     {
       std::lock_guard<std::mutex> lock(buffer_mutex_);
       if (static_cast<int>(audio_buffer_.size()) >= chunk_samples_) {
@@ -110,21 +114,26 @@ void WhisperASREngine::WorkerLoop() {
         audio_buffer_.erase(audio_buffer_.begin(),
                             audio_buffer_.begin() + chunk_samples_);
         buffer_start_ms_ += chunk_duration_ms_;
-      } else if (!running_ && !audio_buffer_.empty()) {
-        chunk = std::move(audio_buffer_);
-        audio_buffer_.clear();
-        chunk_start_ms = buffer_start_ms_;
       }
     }
 
     if (!chunk.empty()) {
       float rms = ComputeRms(chunk);
-
       if (rms < 0.002f) {
         continue;
       }
-
       ProcessChunk(chunk, chunk_start_ms);
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    if (!audio_buffer_.empty()) {
+      float rms = ComputeRms(audio_buffer_);
+      if (rms >= 0.002f) {
+        ProcessChunk(audio_buffer_, buffer_start_ms_);
+      }
+      audio_buffer_.clear();
     }
   }
 }

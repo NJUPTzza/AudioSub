@@ -2,7 +2,7 @@
 // =======
 // audiosub_client.exe 的入口。
 //
-// Stage 4: WebRTC 音频链路 + 音频处理 + 实时语音转写
+// Stage 5: 端到端接线与验证
 //   A端: 麦克风采集 → AudioTrack → WebRTC P2P → B端
 //   B端: AudioTrackSink → PcmRingBuffer → AudioPipeline(重采样+声道转换)
 //              → WhisperASREngine → ConsoleSubtitleConsumer
@@ -17,6 +17,11 @@
 //              → WhisperASREngine(工作线程, 5秒块式识别)
 //              → SubtitleSegment → ConsoleSubtitleConsumer(控制台)
 //
+// 边界处理:
+//   - 音频静默段: RMS < 0.002 的块直接跳过，不送入 whisper
+//   - RingBuffer 溢出: drop-oldest 策略，退出时打印丢弃帧数
+//   - 优雅退出: ASR Stop → Sink 移除 → RingBuffer Close → 线程 join
+//
 // 退出机制:
 //   - 用户输入 /quit
 //   - 对端离线（收到 peer_left 信令）
@@ -24,7 +29,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -54,7 +58,7 @@ void PrintUsage(const char* prog) {
       << " --id <A|B> [--host 127.0.0.1] [--port 8888] "
          "[--model <path>] [--lang <auto|zh|en|...>]\n"
       << "\n"
-      << "Stage 4: WebRTC audio link + real-time ASR subtitles.\n"
+      << "AudioSub: WebRTC real-time audio subtitles.\n"
       << "  A: captures microphone audio and sends via WebRTC\n"
       << "  B: receives audio, resamples to 16kHz/mono, runs ASR, prints subtitles\n"
       << "\n"
@@ -348,19 +352,35 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  // === Step 7: Cleanup ===
+  // === Step 7: Cleanup (order matters) ===
+  // 1. Stop ASR engine first (processes remaining audio in buffer, then exits worker thread)
   if (asr_engine) asr_engine->Stop();
+
+  // 2. Remove sink from remote track (stops new PCM frames from being pushed)
   if (remote_audio_track) {
     remote_audio_track->RemoveSink(remote_sink.get());
     remote_audio_track = nullptr;
   }
+
+  // 3. Signal consume thread to stop and close the ring buffer
   audio_running = false;
-  if (ring_buffer) ring_buffer->Close();
+  if (ring_buffer) {
+    ring_buffer->Close();
+    auto dropped = ring_buffer->dropped_frames();
+    if (dropped > 0) {
+      std::cerr << "[audio] ring buffer dropped " << dropped
+                << " frames due to overflow\n";
+    }
+  }
+
+  // 4. Join consume thread
   if (audio_consume_thread.joinable()) audio_consume_thread.join();
 
+  // 5. Close signaling and peer connection
   signaling.Close();
   pc.Close();
 
+  // 6. Detach stdin thread (can't join because getline may block)
   if (stdin_thread.joinable()) stdin_thread.detach();
 
   std::cout << "bye.\n";

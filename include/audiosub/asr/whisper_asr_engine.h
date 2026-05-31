@@ -37,6 +37,7 @@ class WhisperASREngine : public core::IASREngine {
   std::string language_;
   int chunk_duration_ms_;
   int chunk_samples_;
+  static constexpr int kMaxBufferSamples = 16000 * 30;
 
   whisper_context* ctx_ = nullptr;
   core::ISubtitleConsumer* consumer_ = nullptr;
