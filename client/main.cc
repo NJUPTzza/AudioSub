@@ -2,10 +2,10 @@
 // =======
 // audiosub_client.exe 的入口。
 //
-// Stage 3: WebRTC 音频链路 + 音频处理
+// Stage 4: WebRTC 音频链路 + 音频处理 + 实时语音转写
 //   A端: 麦克风采集 → AudioTrack → WebRTC P2P → B端
 //   B端: AudioTrackSink → PcmRingBuffer → AudioPipeline(重采样+声道转换)
-//              → 控制台打印转换后PCM帧信息
+//              → WhisperASREngine → ConsoleSubtitleConsumer
 //
 // 数据流:
 //
@@ -14,7 +14,8 @@
 //   B端: PeerConnection → AudioTrack → RemoteAudioSink::OnData()
 //              → PcmFrame(48kHz/stereo) → PcmRingBuffer
 //              → AudioPipeline(48kHz→16kHz, stereo→mono)
-//              → PcmFrame(16kHz/mono) → 打印线程
+//              → WhisperASREngine(工作线程, 5秒块式识别)
+//              → SubtitleSegment → ConsoleSubtitleConsumer(控制台)
 //
 // 退出机制:
 //   - 用户输入 /quit
@@ -23,16 +24,24 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#endif
+
 #include <nlohmann/json.hpp>
 
 #include "api/media_stream_interface.h"
+#include "audiosub/asr/whisper_asr_engine.h"
 #include "audiosub/audio/audio_pipeline.h"
 #include "audiosub/audio/pcm_ring_buffer.h"
+#include "audiosub/ui/console_subtitle_consumer.h"
 #include "peer_connection_client.h"
 #include "remote_audio_sink.h"
 #include "signaling_client.h"
@@ -42,15 +51,20 @@ namespace {
 void PrintUsage(const char* prog) {
   std::cout
       << "Usage: " << prog
-      << " --id <A|B> [--host 127.0.0.1] [--port 8888]\n"
+      << " --id <A|B> [--host 127.0.0.1] [--port 8888] "
+         "[--model <path>] [--lang <auto|zh|en|...>]\n"
       << "\n"
-      << "Stage 3: WebRTC audio link + audio processing.\n"
+      << "Stage 4: WebRTC audio link + real-time ASR subtitles.\n"
       << "  A: captures microphone audio and sends via WebRTC\n"
-      << "  B: receives audio, resamples to 16kHz/mono, prints PCM info\n"
+      << "  B: receives audio, resamples to 16kHz/mono, runs ASR, prints subtitles\n"
       << "\n"
       << "Role:\n"
       << "  A: offerer (creates AudioTrack, sends Offer)\n"
-      << "  B: answerer (waits for Offer, receives + processes audio)\n"
+      << "  B: answerer (waits for Offer, receives + processes audio + ASR)\n"
+      << "\n"
+      << "Options:\n"
+      << "  --model <path>  whisper model file (default: models/ggml-small.bin)\n"
+      << "  --lang <code>   ASR language (default: auto, try zh for Chinese)\n"
       << "\n"
       << "Type /quit to exit. Program also exits when peer disconnects.\n";
 }
@@ -59,6 +73,8 @@ struct Args {
   std::string id;
   std::string host = "127.0.0.1";
   int port = 8888;
+  std::string model_path;
+  std::string language = "auto";
 };
 
 bool ParseArgs(int argc, char** argv, Args* out) {
@@ -77,6 +93,10 @@ bool ParseArgs(int argc, char** argv, Args* out) {
       if (const char* v = next("--host")) out->host = v; else return false;
     } else if (a == "--port") {
       if (const char* v = next("--port")) out->port = std::atoi(v); else return false;
+    } else if (a == "--model") {
+      if (const char* v = next("--model")) out->model_path = v; else return false;
+    } else if (a == "--lang") {
+      if (const char* v = next("--lang")) out->language = v; else return false;
     } else if (a == "-h" || a == "--help") {
       return false;
     } else {
@@ -94,13 +114,65 @@ void Println(const std::string& s) {
   std::cout << "\r" << s << "\n> " << std::flush;
 }
 
+#ifdef _WIN32
+void MuteProcessAudioOutput() {
+  IMMDeviceEnumerator* enumerator = nullptr;
+  HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                (void**)&enumerator);
+  if (FAILED(hr)) return;
+
+  IMMDevice* device = nullptr;
+  hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+  if (FAILED(hr)) {
+    enumerator->Release();
+    return;
+  }
+
+  IAudioSessionManager* manager = nullptr;
+  hr = device->Activate(__uuidof(IAudioSessionManager), CLSCTX_ALL, nullptr,
+                        (void**)&manager);
+  if (FAILED(hr)) {
+    device->Release();
+    enumerator->Release();
+    return;
+  }
+
+  ISimpleAudioVolume* volume = nullptr;
+  hr = manager->GetSimpleAudioVolume(nullptr, 0, &volume);
+  if (FAILED(hr)) {
+    manager->Release();
+    device->Release();
+    enumerator->Release();
+    return;
+  }
+
+  volume->SetMute(TRUE, nullptr);
+  std::cerr << "[audio] process audio session muted\n";
+
+  volume->Release();
+  manager->Release();
+  device->Release();
+  enumerator->Release();
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+#endif
+
   Args args;
   if (!ParseArgs(argc, argv, &args)) {
     PrintUsage(argv[0]);
     return 1;
+  }
+
+  if (args.model_path.empty()) {
+    args.model_path = "models/ggml-small.bin";
   }
 
   const bool is_offerer = (args.id == "A");
@@ -113,13 +185,13 @@ int main(int argc, char** argv) {
   }
 
   // === Step 2: Set up audio pipeline ===
-  // A端: add audio track for microphone capture
-  // B端: RingBuffer → AudioPipeline(48kHz→16kHz, stereo→mono) → print thread
   std::unique_ptr<audiosub::audio::PcmRingBuffer> ring_buffer;
   std::unique_ptr<audiosub::RemoteAudioSink> remote_sink;
   std::unique_ptr<audiosub::audio::AudioPipeline> pipeline;
+  std::unique_ptr<audiosub::asr::WhisperASREngine> asr_engine;
+  std::unique_ptr<audiosub::ui::ConsoleSubtitleConsumer> subtitle_consumer;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track;
-  std::thread audio_print_thread;
+  std::thread audio_consume_thread;
   std::atomic<bool> audio_running{false};
   std::atomic<bool> should_exit{false};
 
@@ -135,6 +207,19 @@ int main(int argc, char** argv) {
         std::make_unique<audiosub::RemoteAudioSink>(*ring_buffer);
     pipeline = std::make_unique<audiosub::audio::AudioPipeline>(16000, 1);
 
+    subtitle_consumer =
+        std::make_unique<audiosub::ui::ConsoleSubtitleConsumer>(&g_print_mutex);
+
+    asr_engine =
+        std::make_unique<audiosub::asr::WhisperASREngine>(args.model_path,
+                                                           args.language);
+    asr_engine->SetSubtitleConsumer(subtitle_consumer.get());
+    if (!asr_engine->Initialize()) {
+      std::cerr << "[asr] failed to initialize whisper engine\n";
+      return 2;
+    }
+    Println("[asr] whisper engine initialized (lang=" + args.language + ")");
+
     pc.SetAudioTrackCallback([&](webrtc::AudioTrackInterface* track) {
       remote_audio_track = track;
       track->AddSink(remote_sink.get());
@@ -142,35 +227,15 @@ int main(int argc, char** argv) {
     });
 
     audio_running = true;
-    audio_print_thread = std::thread(
-        [&ring_buffer, &pipeline, &audio_running]() {
-          int64_t frame_count = 0;
+    audio_consume_thread = std::thread(
+        [&ring_buffer, &pipeline, &asr_engine, &audio_running]() {
           while (audio_running.load()) {
             auto frame = ring_buffer->WaitPop();
             if (!frame) break;
 
             auto converted = pipeline->resampler().Process(*frame);
-
-            frame_count++;
-            if (frame_count <= 5 || frame_count % 100 == 0) {
-              int out_frames = static_cast<int>(converted.samples.size()) /
-                               converted.channels;
-              double duration_ms =
-                  static_cast<double>(out_frames) * 1000.0 /
-                  converted.sample_rate;
-              Println("[audio] frame #" + std::to_string(frame_count) +
-                      ": " + std::to_string(frame->sample_rate) + "Hz/" +
-                      std::to_string(frame->channels) + "ch -> " +
-                      std::to_string(converted.sample_rate) + "Hz/" +
-                      std::to_string(converted.channels) + "ch " +
-                      std::to_string(converted.samples.size()) + "samples " +
-                      "ts=" + std::to_string(converted.timestamp_ms) + "ms " +
-                      "(" + std::to_string(duration_ms).substr(0, 5) +
-                      "ms/frame)");
-            }
+            asr_engine->PushAudio(converted);
           }
-          Println("[audio] print thread stopped, total frames: " +
-                  std::to_string(frame_count));
         });
   }
 
@@ -200,6 +265,11 @@ int main(int argc, char** argv) {
 
   pc.SetStateCallback([&](const std::string& state) {
     Println(std::string("[state] ") + state);
+    if (state == "pc:connected") {
+#ifdef _WIN32
+      MuteProcessAudioOutput();
+#endif
+    }
     if (state == "pc:disconnected" || state == "pc:failed" ||
         state == "pc:closed") {
       Println("[pc] peer connection lost, exiting...");
@@ -254,7 +324,7 @@ int main(int argc, char** argv) {
     return 3;
   }
 
-  std::cout << "Role: " << (is_offerer ? "A (offerer, mic capture)" : "B (answerer, audio receive + resample)")
+  std::cout << "Role: " << (is_offerer ? "A (offerer, mic capture)" : "B (answerer, audio receive + ASR)")
             << "\n"
             << "Waiting for peer. Once both peers are online, the offerer "
                "will start.\n"
@@ -279,13 +349,14 @@ int main(int argc, char** argv) {
   }
 
   // === Step 7: Cleanup ===
+  if (asr_engine) asr_engine->Stop();
   if (remote_audio_track) {
     remote_audio_track->RemoveSink(remote_sink.get());
     remote_audio_track = nullptr;
   }
   audio_running = false;
   if (ring_buffer) ring_buffer->Close();
-  if (audio_print_thread.joinable()) audio_print_thread.join();
+  if (audio_consume_thread.joinable()) audio_consume_thread.join();
 
   signaling.Close();
   pc.Close();

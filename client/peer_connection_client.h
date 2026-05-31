@@ -79,7 +79,12 @@
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
+#include "api/audio/audio_device.h"
 #include "rtc_base/thread.h"
+
+#ifdef _WIN32
+namespace webrtc { class ScopedCOMInitializer; }
+#endif
 
 namespace audiosub {
 
@@ -143,6 +148,10 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   bool SendMessage(const std::string& text);
 
   bool AddAudioTrack();
+
+  webrtc::AudioTrackInterface* audio_track() const { return audio_track_.get(); }
+
+  webrtc::AudioDeviceModule* adm() const { return adm_.get(); }
 
   // 优雅关闭：停掉所有线程、释放 WebRTC 资源。析构时也会自动调用。
   void Close();
@@ -251,6 +260,10 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
 
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> audio_track_;
   webrtc::scoped_refptr<webrtc::AudioSourceInterface> audio_source_;
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm_;
+#ifdef _WIN32
+  std::unique_ptr<webrtc::ScopedCOMInitializer> com_initializer_;
+#endif
 };
 
 }  // namespace audiosub

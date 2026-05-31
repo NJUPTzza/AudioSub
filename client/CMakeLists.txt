@@ -29,6 +29,10 @@ target_compile_definitions(audiosub_client PRIVATE
     JSON_NOEXCEPTION
 )
 
+if(MSVC)
+    target_compile_options(audiosub_client PRIVATE /EHs-c- /GR-)
+endif()
+
 # 链接：
 #   webrtc::webrtc 是顶层定义的 imported target，会自动带上 webrtc.lib +
 #                  所有 Windows 系统库 + 必要的头文件路径 + 编译宏。
@@ -37,6 +41,8 @@ target_link_libraries(audiosub_client PRIVATE
     audiosub::core
     audiosub::audio
     audiosub::asr
+    audiosub::ui
     webrtc::webrtc
     ws2_32.lib
+    mmdevapi.lib
 )

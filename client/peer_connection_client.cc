@@ -19,8 +19,15 @@
 #include "api/make_ref_counted.h"
 #include "api/audio_options.h"
 #include "api/media_stream_interface.h"
+#include "api/audio/audio_device.h"
+#include "api/audio/create_audio_device_module.h"
+#include "api/environment/environment_factory.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/ssl_adapter.h"
+
+#ifdef _WIN32
+#include "rtc_base/win/scoped_com_initializer.h"
+#endif
 
 namespace audiosub {
 
@@ -192,23 +199,45 @@ bool PeerConnectionClient::Initialize() {
     return false;
   }
 
-  // 第三步：创建 PeerConnectionFactory。这是创建 PeerConnection 的工厂。
-  //
-  // 参数比较多，但本项目阶段 1 只用 DataChannel，没用音频/视频媒体轨道：
-  //   - audio_*_factory: 传 builtin 实现，后续阶段 2 加麦克风时会用到
-  //   - video_*_factory: nullptr，本项目不做视频
-  //   - audio_mixer / audio_processing: nullptr，用默认
+  // 第三步：创建 Audio Device Module (ADM)。
+  // ADM 负责与操作系统音频设备交互（麦克风采集、扬声器播放）。
+  // 之前传 nullptr 导致麦克风没有打开，音频源产生全零数据。
+  // Windows 上使用 Core Audio API，需要 COM 初始化（MTA 模式）。
+  // 注意：不要手动调用 Init()/StartRecording()！
+  // PeerConnectionFactory 会在 worker 线程上自动初始化 ADM，
+  // 手动在主线程调用会失败（ADM 操作必须在 worker 线程执行）。
+#ifdef _WIN32
+  com_initializer_ = std::make_unique<webrtc::ScopedCOMInitializer>(
+      webrtc::ScopedCOMInitializer::kMTA);
+  if (!com_initializer_->Succeeded()) {
+    std::cerr << "[pc] COM initialization failed\n";
+    return false;
+  }
+#endif
+
+  webrtc::Environment env = webrtc::CreateEnvironment();
+  adm_ = webrtc::CreateAudioDeviceModule(
+      env, webrtc::AudioDeviceModule::kWindowsCoreAudio);
+  if (!adm_) {
+    std::cerr << "[pc] CreateAudioDeviceModule failed\n";
+    return false;
+  }
+  std::cerr << "[pc] audio device module created\n";
+
+  // 第四步：创建 PeerConnectionFactory。这是创建 PeerConnection 的工厂。
+  // Factory 会在 worker 线程上自动调用 adm_->Init()，
+  // 并在音频轨道激活时自动 StartRecording()。
   factory_ = webrtc::CreatePeerConnectionFactory(
       network_thread_.get(),
       worker_thread_.get(),
       signaling_thread_.get(),
-      /*default_adm=*/nullptr,
-      /*audio_encoder_factory=*/webrtc::CreateBuiltinAudioEncoderFactory(),
-      /*audio_decoder_factory=*/webrtc::CreateBuiltinAudioDecoderFactory(),
-      /*video_encoder_factory=*/nullptr,
-      /*video_decoder_factory=*/nullptr,
-      /*audio_mixer=*/nullptr,
-      /*audio_processing=*/nullptr);
+      adm_,
+      webrtc::CreateBuiltinAudioEncoderFactory(),
+      webrtc::CreateBuiltinAudioDecoderFactory(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr);
   if (!factory_) {
     std::cerr << "[pc] CreatePeerConnectionFactory failed\n";
     return false;
@@ -367,6 +396,10 @@ bool PeerConnectionClient::AddAudioTrack() {
   if (!pc_ || !factory_) return false;
 
   webrtc::AudioOptions options;
+  options.echo_cancellation = false;
+  options.auto_gain_control = true;
+  options.noise_suppression = true;
+  options.highpass_filter = true;
   audio_source_ = factory_->CreateAudioSource(options);
   if (!audio_source_) {
     std::cerr << "[pc] CreateAudioSource failed\n";

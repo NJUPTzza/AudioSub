@@ -79,11 +79,16 @@ target_link_libraries(webrtc::webrtc INTERFACE
 )
 
 if(MSVC)
-    add_compile_options(/utf-8 /EHs-c- /GR-)
+    add_compile_options(/utf-8)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
-# Shared header-only contracts for multi-person parallel development.
+function(audiosub_msvc_flags target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /EHs-c- /GR-)
+    endif()
+endfunction()
+
 add_library(audiosub_core INTERFACE)
 add_library(audiosub::core ALIAS audiosub_core)
 target_include_directories(audiosub_core INTERFACE
@@ -101,14 +106,44 @@ target_link_libraries(audiosub_audio PUBLIC audiosub::core webrtc::webrtc)
 target_include_directories(audiosub_audio PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
 )
+audiosub_msvc_flags(audiosub_audio)
+
+set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+set(WHISPER_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+set(GGML_OPENCL OFF CACHE BOOL "" FORCE)
+set(GGML_OPENVINO OFF CACHE BOOL "" FORCE)
+set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+set(GGML_RPC OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/whisper.cpp" whisper.cpp)
 
 add_library(audiosub_asr STATIC
     "${CMAKE_SOURCE_DIR}/src/asr/null_asr_engine.cc"
+    "${CMAKE_SOURCE_DIR}/src/asr/whisper_asr_engine.cc"
 )
 add_library(audiosub::asr ALIAS audiosub_asr)
-target_link_libraries(audiosub_asr PUBLIC audiosub::core)
+target_link_libraries(audiosub_asr PUBLIC audiosub::core whisper)
 target_include_directories(audiosub_asr PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/include"
+    "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/ggml/include"
 )
+audiosub_msvc_flags(audiosub_asr)
+
+add_library(audiosub_ui STATIC
+    "${CMAKE_SOURCE_DIR}/src/ui/console_subtitle_consumer.cc"
+)
+add_library(audiosub::ui ALIAS audiosub_ui)
+target_link_libraries(audiosub_ui PUBLIC audiosub::core)
+target_include_directories(audiosub_ui PUBLIC
+    "${CMAKE_SOURCE_DIR}/include"
+)
+audiosub_msvc_flags(audiosub_ui)
 
 add_subdirectory(client)
