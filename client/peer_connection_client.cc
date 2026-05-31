@@ -4,8 +4,12 @@
 #include "peer_connection_client.h"
 
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <utility>
+#include <vector>
+
+#include "rtc_base/copy_on_write_buffer.h"
 
 #include "api/audio/create_audio_device_module.h"
 #include "api/environment/environment_factory.h"
@@ -31,6 +35,23 @@
 // SendMessage()                        通过 DataChannel 发文字（P2P 直连）
 
 namespace audiosub {
+
+// ===========================================================================
+// DataChannel PCM 协议
+// ===========================================================================
+// A 端 WASAPI 直采的 raw int16 mono PCM 通过 DataChannel 以 binary 帧发送。
+// 每个包前面带一个固定 16 字节 header，描述 PCM 元信息。B 端收到后按 header
+// 解包，原样喂给 ASR（避免 WebRTC 编解码/降噪管线"洗"掉人声）。
+#pragma pack(push, 1)
+struct PcmDcHeader {
+  char     magic[4];          // "PCM1"
+  uint32_t sample_rate;       // 采样率，如 48000
+  uint16_t channels;          // 通道数，当前固定为 1（mono）
+  uint16_t bits_per_sample;   // 位深，固定 16
+  uint32_t sample_count;      // int16 样本个数（不是字节数）
+};
+#pragma pack(pop)
+static_assert(sizeof(PcmDcHeader) == 16, "PcmDcHeader must be 16 bytes");
 
 namespace {
 
@@ -268,37 +289,38 @@ bool PeerConnectionClient::Initialize() {
   // 必须在创建 PeerConnection 前调用一次。重复调用也安全。
   webrtc::InitializeSSL();
 
-  // 第二步：尽量准备本地音频设备模块。就算这里失败，也先允许程序继续跑；
-  // 这样 B 端至少还能接收远端音频，A 端则会在 EnableLocalAudio() 时明确报错。
-  com_initializer_ =
-      std::make_unique<webrtc::ScopedCOMInitializer>(
-          webrtc::ScopedCOMInitializer::kMTA);
-  if (!com_initializer_->Succeeded()) {
-    std::cerr << "[pc] warning: COM init failed, local mic capture disabled\n";
-    com_initializer_.reset();
-  } else {
-    env_ = std::make_unique<webrtc::Environment>(webrtc::CreateEnvironment());
-    // Windows 下某些驱动在某个 ADM layer 能枚举设备但 StartRecording 会失败。
-    // 这里按顺序尝试多个 layer，优先选一个能成功创建的 ADM。
-    const webrtc::AudioDeviceModule::AudioLayer candidate_layers[] = {
-        webrtc::AudioDeviceModule::kPlatformDefaultAudio,
-        webrtc::AudioDeviceModule::kWindowsCoreAudio,
-    };
-    for (auto layer : candidate_layers) {
-      adm_ = webrtc::CreateAudioDeviceModule(*env_, layer);
-      if (adm_) {
-        std::cerr << "[pc] ADM created with layer=" << AudioLayerName(layer)
-                  << "\n";
-        break;
-      }
-      std::cerr << "[pc] ADM create failed with layer=" << AudioLayerName(layer)
-                << "\n";
-    }
-    if (!adm_) {
-      std::cerr << "[pc] warning: failed to create audio device module\n";
+  // 第二步：准备音频设备模块（ADM），用于采集本地麦克风、播放远端音频。
+  {
+    com_initializer_ =
+        std::make_unique<webrtc::ScopedCOMInitializer>(
+            webrtc::ScopedCOMInitializer::kMTA);
+    if (!com_initializer_->Succeeded()) {
+      std::cerr << "[pc] warning: COM init failed, local mic capture disabled\n";
+      com_initializer_.reset();
     } else {
-      adm_ = webrtc::CreateAudioDeviceWithDataObserver(
-          adm_, std::make_unique<AdmCaptureObserver>(this));
+      env_ = std::make_unique<webrtc::Environment>(webrtc::CreateEnvironment());
+      // Windows 下某些驱动在某个 ADM layer 能枚举设备但 StartRecording 会失败。
+      // 这里按顺序尝试多个 layer，优先选一个能成功创建的 ADM。
+      const webrtc::AudioDeviceModule::AudioLayer candidate_layers[] = {
+          webrtc::AudioDeviceModule::kPlatformDefaultAudio,
+          webrtc::AudioDeviceModule::kWindowsCoreAudio,
+      };
+      for (auto layer : candidate_layers) {
+        adm_ = webrtc::CreateAudioDeviceModule(*env_, layer);
+        if (adm_) {
+          std::cerr << "[pc] ADM created with layer=" << AudioLayerName(layer)
+                    << "\n";
+          break;
+        }
+        std::cerr << "[pc] ADM create failed with layer=" << AudioLayerName(layer)
+                  << "\n";
+      }
+      if (!adm_) {
+        std::cerr << "[pc] warning: failed to create audio device module\n";
+      } else {
+        adm_ = webrtc::CreateAudioDeviceWithDataObserver(
+            adm_, std::make_unique<AdmCaptureObserver>(this));
+      }
     }
   }
 
@@ -383,6 +405,10 @@ void PeerConnectionClient::Close() {
   // [L8] 清理链路：按固定顺序释放，避免回调野指针/线程析构卡住。
   // 关闭顺序很重要：DataChannel -> PeerConnection -> Factory -> 线程
   // 反过来会出问题（线程停了之后 PeerConnection 析构会卡）。
+
+  // 先停 WASAPI，避免它在 DataChannel 关掉之后还往 dc_ 发包。
+  wasapi_talking_.store(false, std::memory_order_relaxed);
+  wasapi_mic_.Stop();
 
   {
     std::lock_guard<std::mutex> lock(audio_mutex_);
@@ -508,6 +534,31 @@ bool PeerConnectionClient::EnableLocalAudio() {
   if (state_cb_) {
     state_cb_("audio:local-track-added");
   }
+
+  // WASAPI 模式下，仍然走旧链路：
+  //   A 端 WASAPI 直采 raw PCM -> DataChannel binary -> B 端 ASR。
+  // WebRTC 模式下，不启动 WASAPI，音频由 local_audio_track_ 通过 WebRTC 媒体链路发送。
+  if (audio_path_.load(std::memory_order_relaxed) ==
+      AudioPath::kWasapiDataChannel) {
+    wasapi_talking_ = false;
+    wasapi_mic_.Start([this](const int16_t* samples,
+                             std::size_t sample_count,
+                             int sample_rate,
+                             int channels) {
+      if (!wasapi_talking_.load(std::memory_order_relaxed)) {
+        return;  // /talk off 状态下不向对端发送
+      }
+      SendPcmDataChannel(samples, sample_count, sample_rate, channels);
+    });
+    if (state_cb_) {
+      state_cb_("audio:path-wasapi-datachannel");
+    }
+  } else {
+    if (state_cb_) {
+      state_cb_("audio:path-webrtc-track");
+    }
+  }
+
   return true;
 }
 
@@ -518,6 +569,7 @@ bool PeerConnectionClient::SetLocalAudioEnabled(bool enabled) {
     std::cerr << "[pc] local audio track not ready\n";
     return false;
   }
+
   // 某些 Windows 设备在 built-in AEC 路径下，仅 set_enabled(true) 不足以让
   // 采集线程真正跑起来。这里显式确保 ADM 已经进入 Recording 状态。
   if (enabled && adm_) {
@@ -540,10 +592,7 @@ bool PeerConnectionClient::SetLocalAudioEnabled(bool enabled) {
       } else {
         std::cerr << "[pc] local audio: recording started after fallback\n";
       }
-      // 如果只是为了重试而临时开了 playout，但最终录音仍没起来，这里就回滚。
-      if (!adm_->Recording() && playout_started && adm_->Playing()) {
-        adm_->StopPlayout();
-      }
+      (void)playout_started;
     } else if (adm_->Recording()) {
       std::cerr << "[pc] local audio: recording already active\n";
     }
@@ -560,6 +609,7 @@ bool PeerConnectionClient::SetLocalAudioEnabled(bool enabled) {
     std::cerr << "[pc] failed to change local audio track state\n";
     return false;
   }
+  wasapi_talking_.store(enabled, std::memory_order_relaxed);
   if (state_cb_) {
     state_cb_(enabled ? "audio:talking" : "audio:silent");
   }
@@ -686,6 +736,14 @@ void PeerConnectionClient::DeliverLocalAudioFrame(const core::PcmFrame& frame) {
 }
 
 void PeerConnectionClient::DeliverRemoteAudioFrame(const core::PcmFrame& frame) {
+  // WASAPI 模式：远端真实 PCM 来自 DataChannel，WebRTC AudioTrack 上的帧不送 ASR，
+  // 避免静音帧/处理后音频干扰识别。
+  if (audio_path_.load(std::memory_order_relaxed) ==
+      AudioPath::kWasapiDataChannel) {
+    return;
+  }
+  // WebRTC 模式：远端 PCM 来自 AudioTrackSinkInterface，交给 main.cc 里的
+  // remote_audio_frame_cb_，后面会进入 ring buffer -> AsrAudioConverter -> Whisper。
   if (remote_audio_frame_cb_) {
     remote_audio_frame_cb_(frame);
   }
@@ -789,11 +847,91 @@ void PeerConnectionClient::OnStateChange() {
 
 void PeerConnectionClient::OnMessage(const webrtc::DataBuffer& buffer) {
   // 收到对端发来的一条 DataChannel 消息。
-  // buffer.data 是字节数组（CopyOnWriteBuffer），buffer.binary 表示是不是
-  // 二进制（对面发字符串时是 false）。我们一律按文字处理。
+  //   - binary=true  -> WASAPI 路径的 raw PCM 数据包（PcmDcHeader + samples）
+  //   - binary=false -> 普通文字（聊天用）
+  if (buffer.binary) {
+    HandlePcmDataChannel(buffer);
+    return;
+  }
   if (!message_cb_) return;
   std::string text(buffer.data.data<char>(), buffer.data.size());
   message_cb_(text);
+}
+
+// ===========================================================================
+// WASAPI PCM 通过 DataChannel 收发
+// ===========================================================================
+
+bool PeerConnectionClient::SendPcmDataChannel(const int16_t* samples,
+                                              std::size_t sample_count,
+                                              int sample_rate,
+                                              int channels) {
+  if (!samples || sample_count == 0) return false;
+
+  // 取一份 DataChannel 智能指针，避免在持锁期间走网络栈。
+  webrtc::scoped_refptr<webrtc::DataChannelInterface> dc;
+  {
+    std::lock_guard<std::mutex> lock(dc_mutex_);
+    dc = dc_;
+  }
+  if (!dc || dc->state() != webrtc::DataChannelInterface::kOpen) {
+    return false;
+  }
+
+  PcmDcHeader header{};
+  header.magic[0] = 'P';
+  header.magic[1] = 'C';
+  header.magic[2] = 'M';
+  header.magic[3] = '1';
+  header.sample_rate     = static_cast<uint32_t>(sample_rate);
+  header.channels        = static_cast<uint16_t>(channels);
+  header.bits_per_sample = 16;
+  header.sample_count    = static_cast<uint32_t>(sample_count);
+
+  const std::size_t pcm_bytes = sample_count * sizeof(int16_t);
+  const std::size_t total = sizeof(PcmDcHeader) + pcm_bytes;
+  std::vector<uint8_t> packet(total);
+  std::memcpy(packet.data(), &header, sizeof(PcmDcHeader));
+  std::memcpy(packet.data() + sizeof(PcmDcHeader), samples, pcm_bytes);
+
+  webrtc::CopyOnWriteBuffer cow;
+  cow.AppendData(packet.data(), packet.size());
+  webrtc::DataBuffer data_buffer(cow, /*binary=*/true);
+  return dc->Send(data_buffer);
+}
+
+void PeerConnectionClient::HandlePcmDataChannel(
+    const webrtc::DataBuffer& buffer) {
+  if (buffer.data.size() < sizeof(PcmDcHeader)) return;
+
+  PcmDcHeader header{};
+  std::memcpy(&header, buffer.data.data(), sizeof(PcmDcHeader));
+  if (header.magic[0] != 'P' || header.magic[1] != 'C' ||
+      header.magic[2] != 'M' || header.magic[3] != '1') {
+    return;
+  }
+  if (header.bits_per_sample != 16 || header.channels == 0 ||
+      header.sample_count == 0) {
+    return;
+  }
+
+  const std::size_t pcm_bytes =
+      static_cast<std::size_t>(header.sample_count) * sizeof(int16_t);
+  if (buffer.data.size() < sizeof(PcmDcHeader) + pcm_bytes) return;
+
+  const int16_t* samples = reinterpret_cast<const int16_t*>(
+      buffer.data.data() + sizeof(PcmDcHeader));
+
+  // 投递给业务侧。直接复用 remote_audio_frame_cb_：业务侧 main.cc 里早就接好
+  // 了这个回调把 PCM 推进 ASR 缓冲。
+  if (!remote_audio_frame_cb_) return;
+  core::PcmFrame frame;
+  frame.sample_rate     = static_cast<int>(header.sample_rate);
+  frame.channels        = static_cast<int>(header.channels);
+  frame.bits_per_sample = 16;
+  frame.timestamp_ms    = 0;
+  frame.samples.assign(samples, samples + header.sample_count);
+  remote_audio_frame_cb_(frame);
 }
 
 }  // namespace audiosub

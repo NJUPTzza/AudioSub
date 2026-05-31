@@ -26,6 +26,19 @@ namespace audiosub {
 
 class SignalingClient {
  public:
+
+  enum class AudioPath {
+    // waasapi 路径：WASAPI 采集 raw PCM，通过 DataChannel 发给 B。
+    kWasapiDataChannel,
+    // webrtc audiotrack 路径：A 端用 WebRTC AudioTrack 采集并发送，B 端从 AudioTrackSinkInterface 取 PCM。
+    kWebrtcTrack,
+  };
+
+  // 设置音频链路模式。约定在 Initialize() 后、CreateOffer 前调用。
+  void SetAudioPath(AudioPath path) {
+    audio_path_.store(path, std::memory_order_relaxed);
+  }
+
   // 收到对端/服务器消息时被调用的回调类型。
   // 参数 msg 是解析好的 JSON 对象，由调用方自行判断 type 字段。
   using MessageHandler = std::function<void(const nlohmann::json& msg)>;
@@ -82,6 +95,9 @@ class SignalingClient {
   // handler_ 的读写要同步：主线程可能 SetMessageHandler，recv 线程会读。
   std::mutex handler_mutex_;
   MessageHandler handler_;
+
+  // 当前音频链路模式。默认保持旧逻辑：WASAPI + DataChannel。
+  std::atomic<AudioPath> audio_path_{AudioPath::kWasapiDataChannel};
 };
 
 }  // namespace audiosub

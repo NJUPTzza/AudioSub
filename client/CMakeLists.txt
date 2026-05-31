@@ -11,6 +11,7 @@ add_executable(audiosub_client
     main.cc
     signaling_client.cc
     peer_connection_client.cc
+    wasapi_mic_capture.cc
 )
 
 # 头文件搜索路径：

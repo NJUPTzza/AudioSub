@@ -21,6 +21,7 @@
 #include <string>
 
 #include "core/types.h"
+#include "wasapi_mic_capture.h"
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
 #include "api/peer_connection_interface.h"
@@ -79,8 +80,18 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   PeerConnectionClient(const PeerConnectionClient&) = delete;
   PeerConnectionClient& operator=(const PeerConnectionClient&) = delete;
 
+  enum class AudioPath {
+    // 旧链路：A 端 WASAPI 直采 raw PCM，经 DataChannel binary 发给 B。
+    kWasapiDataChannel,
+
+    // 新链路：A 端 WebRTC AudioTrack 采集，B 端从 AudioTrackSinkInterface 取 PCM。
+    kWebrtcTrack,
+  };
+
   // 启动 WebRTC：建 3 个线程、创建 Factory、创建 PeerConnection。
-  // 必须先调它，再调其他业务方法。失败返回 false。
+  // enable_audio_device 只应在需要本地麦克风采集的一端开启。
+  // B 端只需要从远端 AudioTrackSinkInterface 取 PCM，不需要真实播放设备；
+  // 关闭它可以避免 WebRTC 默认把远端音频播放到扬声器，导致同机测试听见自己。
   bool Initialize();
 
   // A 端入口：创建一个名为 "chat" 的 DataChannel，然后生成 Offer。
@@ -95,6 +106,12 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // true  表示 A 端开始讲话；
   // false 表示 A 端结束讲话（轨道仍保留，但发送静音）。
   bool SetLocalAudioEnabled(bool enabled);
+
+  // 设置音频链路模式。默认是 WASAPI + DataChannel，保持原有行为。
+  // 约定在 Initialize() 后、EnableLocalAudio()/CreateOfferAndDataChannel() 前调用。
+  void SetAudioPath(AudioPath path) {
+    audio_path_.store(path, std::memory_order_relaxed);
+  }
 
   // B 端入口：在 SetRemoteSdp(kOffer, ...) 之后调用，生成 Answer。
   // Answer 生成完通过 SdpReadyCallback 通知。
@@ -228,11 +245,33 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc_;
 
   // 本地发送的麦克风轨道，以及远端到达后绑定 sink 的音频轨道。
+  // 注：当前 P0 链路下，A 端音频实际走 WASAPI + DataChannel 二进制路径，
+  // 这些 AudioTrack 成员仅保留以兼容 SDP 协商时已有的 audio m= section，
+  // 真正的 PCM 不再依赖 WebRTC 编解码 / NS / AEC / AGC。
   std::mutex audio_mutex_;
   webrtc::scoped_refptr<webrtc::AudioSourceInterface> local_audio_source_;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> local_audio_track_;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track_;
   std::unique_ptr<RemoteAudioSink> remote_audio_sink_;
+
+  // WASAPI 直采路径，绕开 WebRTC 音频处理管线。
+  // A 端启用本地音频时启动，把 raw int16 mono PCM 通过 DataChannel 发到对端。
+  WasapiMicCapture wasapi_mic_;
+  // /talk on / off 控制实际是否往 DataChannel 推送 PCM 包。
+  std::atomic<bool> wasapi_talking_{false};
+
+  // 当前音频链路模式。默认保持旧逻辑，避免影响已有测试路径。
+  std::atomic<AudioPath> audio_path_{AudioPath::kWasapiDataChannel};
+
+  // 把 raw int16 PCM 封装成 PcmDcHeader + 数据，通过 DataChannel 发送。
+  // 返回 false 表示 DataChannel 未就绪或对象状态异常。
+  bool SendPcmDataChannel(const int16_t* samples,
+                          std::size_t sample_count,
+                          int sample_rate,
+                          int channels);
+
+  // 收到 binary DataChannel 消息时，按 PcmDcHeader 协议解包后投递给业务回调。
+  void HandlePcmDataChannel(const webrtc::DataBuffer& buffer);
 
   // === 业务回调 ===
   SdpReadyCallback sdp_ready_cb_;

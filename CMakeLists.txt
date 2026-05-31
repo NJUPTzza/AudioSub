@@ -53,6 +53,28 @@ if(EXISTS "${WEBRTC_SDK_DIR}/VERSION.txt")
     message(STATUS "WebRTC SDK:\n${WEBRTC_SDK_VERSION_RAW}")
 endif()
 
+# --- whisper.cpp ---
+# 关闭非必要目标，避免把示例/工具都编进去
+set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/whisper.cpp" EXCLUDE_FROM_ALL)
+
+# whisper.cpp 不同版本 target 名称可能不同，做兼容探测
+set(AUDIOSUB_WHISPER_TARGET "")
+if (TARGET whisper)
+    set(AUDIOSUB_WHISPER_TARGET whisper)
+elseif (TARGET whisper-lib)
+    set(AUDIOSUB_WHISPER_TARGET whisper-lib)
+elseif (TARGET ggml-whisper)
+    set(AUDIOSUB_WHISPER_TARGET ggml-whisper)
+else()
+    message(FATAL_ERROR
+        "Cannot find whisper target. Checked: whisper, whisper-lib, ggml-whisper")
+endif()
+
 # --- imported target: webrtc::webrtc ---
 add_library(webrtc::webrtc STATIC IMPORTED GLOBAL)
 set_target_properties(webrtc::webrtc PROPERTIES
@@ -93,6 +115,8 @@ target_include_directories(audiosub_core INTERFACE
 add_library(audiosub_audio STATIC
     "${CMAKE_SOURCE_DIR}/src/audio/pcm_ring_buffer.cc"
     "${CMAKE_SOURCE_DIR}/src/audio/pass_through_audio_pipeline.cc"
+    "${CMAKE_SOURCE_DIR}/src/audio/asr_audio_converter.cc"
+    "${CMAKE_SOURCE_DIR}/src/audio/asr_chunker.cc"
 )
 add_library(audiosub::audio ALIAS audiosub_audio)
 target_link_libraries(audiosub_audio PUBLIC audiosub::core)
@@ -102,11 +126,17 @@ target_include_directories(audiosub_audio PUBLIC
 
 add_library(audiosub_asr STATIC
     "${CMAKE_SOURCE_DIR}/src/asr/null_asr_engine.cc"
+    "${CMAKE_SOURCE_DIR}/src/asr/whisper_cpp_engine.cc"
 )
 add_library(audiosub::asr ALIAS audiosub_asr)
-target_link_libraries(audiosub_asr PUBLIC audiosub::core)
+target_link_libraries(audiosub_asr PUBLIC
+    audiosub::core
+    ${AUDIOSUB_WHISPER_TARGET}
+)
 target_include_directories(audiosub_asr PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp"
+    "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/include"
 )
 
 add_subdirectory(client)
