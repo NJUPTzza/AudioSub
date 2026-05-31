@@ -1,32 +1,3 @@
-// main.cc
-// =======
-// audiosub_client.exe 的入口。
-//
-// Stage 5: 端到端接线与验证
-//   A端: 麦克风采集 → AudioTrack → WebRTC P2P → B端
-//   B端: AudioTrackSink → PcmRingBuffer → AudioPipeline(重采样+声道转换)
-//              → WhisperASREngine → ConsoleSubtitleConsumer
-//
-// 数据流:
-//
-//   A端: 麦克风 → ADM → AudioSource → AudioTrack → PeerConnection
-//                                                              ↓ P2P
-//   B端: PeerConnection → AudioTrack → RemoteAudioSink::OnData()
-//              → PcmFrame(48kHz/stereo) → PcmRingBuffer
-//              → AudioPipeline(48kHz→16kHz, stereo→mono)
-//              → WhisperASREngine(工作线程, 5秒块式识别)
-//              → SubtitleSegment → ConsoleSubtitleConsumer(控制台)
-//
-// 边界处理:
-//   - 音频静默段: RMS < 0.002 的块直接跳过，不送入 whisper
-//   - RingBuffer 溢出: drop-oldest 策略，退出时打印丢弃帧数
-//   - 优雅退出: ASR Stop → Sink 移除 → RingBuffer Close → 线程 join
-//
-// 退出机制:
-//   - 用户输入 /quit
-//   - 对端离线（收到 peer_left 信令）
-//   - WebRTC 连接断开（pc:disconnected / pc:failed / pc:closed）
-
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -43,7 +14,7 @@
 
 #include "api/media_stream_interface.h"
 #include "audiosub/asr/whisper_asr_engine.h"
-#include "audiosub/audio/audio_pipeline.h"
+#include "audiosub/audio/audio_resampler.h"
 #include "audiosub/audio/pcm_ring_buffer.h"
 #include "audiosub/ui/console_subtitle_consumer.h"
 #include "peer_connection_client.h"
@@ -58,19 +29,14 @@ void PrintUsage(const char* prog) {
       << " --id <A|B> [--host 127.0.0.1] [--port 8888] "
          "[--model <path>] [--lang <auto|zh|en|...>]\n"
       << "\n"
-      << "AudioSub: WebRTC real-time audio subtitles.\n"
       << "  A: captures microphone audio and sends via WebRTC\n"
-      << "  B: receives audio, resamples to 16kHz/mono, runs ASR, prints subtitles\n"
-      << "\n"
-      << "Role:\n"
-      << "  A: offerer (creates AudioTrack, sends Offer)\n"
-      << "  B: answerer (waits for Offer, receives + processes audio + ASR)\n"
+      << "  B: receives audio, runs ASR, prints subtitles\n"
       << "\n"
       << "Options:\n"
       << "  --model <path>  whisper model file (default: models/ggml-small.bin)\n"
       << "  --lang <code>   ASR language (default: auto, try zh for Chinese)\n"
       << "\n"
-      << "Type /quit to exit. Program also exits when peer disconnects.\n";
+      << "Type /quit to exit.\n";
 }
 
 struct Args {
@@ -152,7 +118,6 @@ void MuteProcessAudioOutput() {
   }
 
   volume->SetMute(TRUE, nullptr);
-  std::cerr << "[audio] process audio session muted\n";
 
   volume->Release();
   manager->Release();
@@ -181,17 +146,15 @@ int main(int argc, char** argv) {
 
   const bool is_offerer = (args.id == "A");
 
-  // === Step 1: Initialize WebRTC ===
   audiosub::PeerConnectionClient pc;
   if (!pc.Initialize()) {
-    std::cerr << "PeerConnectionClient::Initialize() failed\n";
+    std::cerr << "Initialize() failed\n";
     return 2;
   }
 
-  // === Step 2: Set up audio pipeline ===
   std::unique_ptr<audiosub::audio::PcmRingBuffer> ring_buffer;
   std::unique_ptr<audiosub::RemoteAudioSink> remote_sink;
-  std::unique_ptr<audiosub::audio::AudioPipeline> pipeline;
+  std::unique_ptr<audiosub::audio::AudioResampler> resampler;
   std::unique_ptr<audiosub::asr::WhisperASREngine> asr_engine;
   std::unique_ptr<audiosub::ui::ConsoleSubtitleConsumer> subtitle_consumer;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track;
@@ -204,12 +167,11 @@ int main(int argc, char** argv) {
       std::cerr << "AddAudioTrack() failed\n";
       return 2;
     }
-    Println("[audio] microphone audio track added (A)");
   } else {
     ring_buffer = std::make_unique<audiosub::audio::PcmRingBuffer>(200);
     remote_sink =
         std::make_unique<audiosub::RemoteAudioSink>(*ring_buffer);
-    pipeline = std::make_unique<audiosub::audio::AudioPipeline>(16000, 1);
+    resampler = std::make_unique<audiosub::audio::AudioResampler>(16000, 1);
 
     subtitle_consumer =
         std::make_unique<audiosub::ui::ConsoleSubtitleConsumer>(&g_print_mutex);
@@ -219,25 +181,23 @@ int main(int argc, char** argv) {
                                                            args.language);
     asr_engine->SetSubtitleConsumer(subtitle_consumer.get());
     if (!asr_engine->Initialize()) {
-      std::cerr << "[asr] failed to initialize whisper engine\n";
+      std::cerr << "ASR initialize failed\n";
       return 2;
     }
-    Println("[asr] whisper engine initialized (lang=" + args.language + ")");
 
     pc.SetAudioTrackCallback([&](webrtc::AudioTrackInterface* track) {
       remote_audio_track = track;
       track->AddSink(remote_sink.get());
-      Println("[audio] remote audio track received, sink attached (B)");
     });
 
     audio_running = true;
     audio_consume_thread = std::thread(
-        [&ring_buffer, &pipeline, &asr_engine, &audio_running]() {
+        [&ring_buffer, &resampler, &asr_engine, &audio_running]() {
           while (audio_running.load()) {
             auto frame = ring_buffer->WaitPop();
             if (!frame) break;
 
-            auto converted = pipeline->resampler().Process(*frame);
+            auto converted = resampler->Process(*frame);
             asr_engine->PushAudio(converted);
           }
         });
@@ -245,16 +205,12 @@ int main(int argc, char** argv) {
 
   audiosub::SignalingClient signaling;
 
-  // === Step 3: Wire WebRTC callbacks to signaling ===
-
   pc.SetSdpReadyCallback(
       [&signaling](webrtc::SdpType type, const std::string& sdp) {
         std::string type_str =
             (type == webrtc::SdpType::kOffer) ? "offer" : "answer";
         nlohmann::json msg = {{"type", type_str}, {"sdp", sdp}};
         signaling.Send(msg);
-        Println(std::string("[pc] local ") + type_str + " sent (" +
-                std::to_string(sdp.size()) + " bytes)");
       });
 
   pc.SetIceCandidateCallback(
@@ -268,74 +224,58 @@ int main(int argc, char** argv) {
       });
 
   pc.SetStateCallback([&](const std::string& state) {
-    Println(std::string("[state] ") + state);
     if (state == "pc:connected") {
+      Println("connected");
 #ifdef _WIN32
       MuteProcessAudioOutput();
 #endif
     }
     if (state == "pc:disconnected" || state == "pc:failed" ||
         state == "pc:closed") {
-      Println("[pc] peer connection lost, exiting...");
       should_exit = true;
       audio_running = false;
       if (ring_buffer) ring_buffer->Close();
     }
   });
 
-  // === Step 4: Wire signaling callbacks to WebRTC ===
   signaling.SetMessageHandler(
       [&pc, is_offerer, &should_exit, &ring_buffer, &audio_running](
           const nlohmann::json& msg) {
         std::string type = msg.value("type", "");
 
         if (type == "peer_ready") {
-          Println(std::string("[peer] ") + msg.value("peer", "?") +
-                  " is online");
+          Println(std::string("peer ") + msg.value("peer", "?") + " online");
           if (is_offerer) {
-            Println("[pc] creating Offer + DataChannel...");
             pc.CreateOfferAndDataChannel();
           }
 
         } else if (type == "peer_left") {
-          Println(std::string("[peer] ") + msg.value("peer", "?") +
-                  " left, exiting...");
+          Println(std::string("peer ") + msg.value("peer", "?") + " left");
           should_exit = true;
           audio_running = false;
           if (ring_buffer) ring_buffer->Close();
 
         } else if (type == "offer") {
-          Println("[pc] received Offer from peer");
           pc.SetRemoteSdp(webrtc::SdpType::kOffer, msg.value("sdp", ""));
           pc.CreateAnswer();
 
         } else if (type == "answer") {
-          Println("[pc] received Answer from peer");
           pc.SetRemoteSdp(webrtc::SdpType::kAnswer, msg.value("sdp", ""));
 
         } else if (type == "candidate") {
           pc.AddRemoteIceCandidate(msg.value("sdpMid", ""),
                                    msg.value("sdpMLineIndex", 0),
                                    msg.value("candidate", ""));
-
-        } else {
-          Println(std::string("[signal] unhandled type=") + type);
         }
       });
 
-  // === Step 5: Connect to signaling server ===
   if (!signaling.Connect(args.host, args.port, args.id)) {
     return 3;
   }
 
-  std::cout << "Role: " << (is_offerer ? "A (offerer, mic capture)" : "B (answerer, audio receive + ASR)")
-            << "\n"
-            << "Waiting for peer. Once both peers are online, the offerer "
-               "will start.\n"
-            << "Type /quit to exit. Program also exits when peer disconnects.\n"
-            << "> " << std::flush;
+  std::cout << "Role: " << (is_offerer ? "A (mic)" : "B (asr)")
+            << "  /quit to exit\n> " << std::flush;
 
-  // === Step 6: stdin reader thread + main wait loop ===
   std::thread stdin_thread([&]() {
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -352,35 +292,21 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  // === Step 7: Cleanup (order matters) ===
-  // 1. Stop ASR engine first (processes remaining audio in buffer, then exits worker thread)
   if (asr_engine) asr_engine->Stop();
 
-  // 2. Remove sink from remote track (stops new PCM frames from being pushed)
   if (remote_audio_track) {
     remote_audio_track->RemoveSink(remote_sink.get());
     remote_audio_track = nullptr;
   }
 
-  // 3. Signal consume thread to stop and close the ring buffer
   audio_running = false;
-  if (ring_buffer) {
-    ring_buffer->Close();
-    auto dropped = ring_buffer->dropped_frames();
-    if (dropped > 0) {
-      std::cerr << "[audio] ring buffer dropped " << dropped
-                << " frames due to overflow\n";
-    }
-  }
+  if (ring_buffer) ring_buffer->Close();
 
-  // 4. Join consume thread
   if (audio_consume_thread.joinable()) audio_consume_thread.join();
 
-  // 5. Close signaling and peer connection
   signaling.Close();
   pc.Close();
 
-  // 6. Detach stdin thread (can't join because getline may block)
   if (stdin_thread.joinable()) stdin_thread.detach();
 
   std::cout << "bye.\n";

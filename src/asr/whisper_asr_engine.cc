@@ -4,7 +4,18 @@
 #include <cmath>
 #include <iostream>
 
+#include "ggml.h"
 #include "whisper.h"
+
+namespace {
+
+void WhisperLogCallback(ggml_log_level level, const char* text, void*) {
+  if (level >= GGML_LOG_LEVEL_WARN && text && text[0] != '\0') {
+    std::cerr << text;
+  }
+}
+
+}  // namespace
 
 namespace audiosub::asr {
 
@@ -25,18 +36,16 @@ WhisperASREngine::~WhisperASREngine() {
 }
 
 bool WhisperASREngine::Initialize() {
+  whisper_log_set(WhisperLogCallback, nullptr);
+
   whisper_context_params cparams = whisper_context_default_params();
   cparams.use_gpu = false;
 
   ctx_ = whisper_init_from_file_with_params(model_path_.c_str(), cparams);
   if (!ctx_) {
-    std::cerr << "[asr] failed to load whisper model: " << model_path_
-              << "\n";
+    std::cerr << "failed to load whisper model: " << model_path_ << "\n";
     return false;
   }
-
-  std::cerr << "[asr] whisper model loaded: " << model_path_
-            << " (language=" << language_ << ")\n";
 
   running_ = true;
   worker_thread_ = std::thread(&WhisperASREngine::WorkerLoop, this);

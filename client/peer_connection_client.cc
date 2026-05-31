@@ -1,12 +1,3 @@
-// peer_connection_client.cc
-// =========================
-// WebRTC PeerConnection 封装的实现。
-//
-// 主要复杂度集中在 3 个地方：
-//   1. 三个 WebRTC 内部线程的启动和销毁
-//   2. SDP 异步流程：CreateOffer/Answer -> SetLocalDescription -> 信令送出
-//   3. 各种 Observer 嵌套类（WebRTC 要求 SDP observer 必须是 RefCounted）
-
 #include "peer_connection_client.h"
 
 #include <iostream>
@@ -33,23 +24,17 @@ namespace audiosub {
 
 namespace {
 
-// Google 公开的 STUN 服务器。STUN 用来帮助本端发现自己的公网 IP，
-// 让两个不同 NAT 后面的端能互连。同机/同局域网测试其实用不到。
 const char kStunServer[] = "stun:stun.l.google.com:19302";
-
-// DataChannel 的标签名（双方约定一致即可，作为通道的标识）。
 const char kDataChannelLabel[] = "chat";
-
-// === 一些枚举到字符串的辅助函数，仅用于打日志 ===
 
 const char* SignalingStateName(
     webrtc::PeerConnectionInterface::SignalingState s) {
   using S = webrtc::PeerConnectionInterface::SignalingState;
   switch (s) {
-    case S::kStable: return "stable";                       // 没有未完成的 offer/answer
-    case S::kHaveLocalOffer: return "have-local-offer";     // 本端发出了 offer，等对端 answer
+    case S::kStable: return "stable";
+    case S::kHaveLocalOffer: return "have-local-offer";
     case S::kHaveLocalPrAnswer: return "have-local-pranswer";
-    case S::kHaveRemoteOffer: return "have-remote-offer";   // 收到了对端 offer，准备 answer
+    case S::kHaveRemoteOffer: return "have-remote-offer";
     case S::kHaveRemotePrAnswer: return "have-remote-pranswer";
     case S::kClosed: return "closed";
   }
@@ -61,9 +46,9 @@ const char* IceConnectionStateName(
   using S = webrtc::PeerConnectionInterface::IceConnectionState;
   switch (s) {
     case S::kIceConnectionNew: return "ice:new";
-    case S::kIceConnectionChecking: return "ice:checking";   // 正在试 candidate pair
-    case S::kIceConnectionConnected: return "ice:connected"; // 至少一对 pair 通了
-    case S::kIceConnectionCompleted: return "ice:completed"; // 所有 pair 都试完了
+    case S::kIceConnectionChecking: return "ice:checking";
+    case S::kIceConnectionConnected: return "ice:connected";
+    case S::kIceConnectionCompleted: return "ice:completed";
     case S::kIceConnectionFailed: return "ice:failed";
     case S::kIceConnectionDisconnected: return "ice:disconnected";
     case S::kIceConnectionClosed: return "ice:closed";
@@ -76,8 +61,8 @@ const char* PeerConnectionStateName(
   using S = webrtc::PeerConnectionInterface::PeerConnectionState;
   switch (s) {
     case S::kNew: return "pc:new";
-    case S::kConnecting: return "pc:connecting"; // ICE + DTLS 进行中
-    case S::kConnected: return "pc:connected";   // 通了！这是你最想看到的状态
+    case S::kConnecting: return "pc:connecting";
+    case S::kConnected: return "pc:connected";
     case S::kDisconnected: return "pc:disconnected";
     case S::kFailed: return "pc:failed";
     case S::kClosed: return "pc:closed";
@@ -87,25 +72,12 @@ const char* PeerConnectionStateName(
 
 }  // namespace
 
-// ===========================================================================
-// 三个 SDP Observer 嵌套类
-// ===========================================================================
-// 为什么要单独搞嵌套类，而不是让 PeerConnectionClient 直接继承？
-//   - 这些 Observer 接口继承自 webrtc::RefCountInterface（引用计数对象），
-//     必须用 webrtc::scoped_refptr 持有。
-//   - 但 PeerConnectionClient 是普通对象（外部用裸指针/局部变量管理），
-//     不能让它"被引用计数管理"。
-// 所以做法是：嵌套类做"皮"，只把回调转发给 parent_ 指针。
-
 class PeerConnectionClient::CreateSdpObserver
     : public webrtc::CreateSessionDescriptionObserver {
  public:
   explicit CreateSdpObserver(PeerConnectionClient* parent) : parent_(parent) {}
 
-  // CreateOffer/CreateAnswer 成功完成
   void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-    // WebRTC 通过裸指针给我们传过来 SessionDescriptionInterface，文档说"我
-    // 们拿到所有权"。立刻 wrap 成 unique_ptr 避免泄漏。
     parent_->OnLocalSdpReady(
         std::unique_ptr<webrtc::SessionDescriptionInterface>(desc));
   }
@@ -115,8 +87,6 @@ class PeerConnectionClient::CreateSdpObserver
   }
 
  private:
-  // 注意是裸指针：parent 的生命周期 >= 本 observer。这点由 PeerConnectionClient
-  // 在 Close() 中先停掉 WebRTC 再析构来保证。
   PeerConnectionClient* const parent_;
 };
 
@@ -129,8 +99,6 @@ class PeerConnectionClient::SetLocalDescObserver
   void OnSetLocalDescriptionComplete(webrtc::RTCError error) override {
     if (!error.ok()) {
       parent_->OnSdpFailure("SetLocal", std::move(error));
-    } else {
-      RTC_LOG(LS_INFO) << "[pc] SetLocalDescription OK";
     }
   }
 
@@ -147,8 +115,6 @@ class PeerConnectionClient::SetRemoteDescObserver
   void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
     if (!error.ok()) {
       parent_->OnSdpFailure("SetRemote", std::move(error));
-    } else {
-      RTC_LOG(LS_INFO) << "[pc] SetRemoteDescription OK";
     }
   }
 
@@ -156,27 +122,12 @@ class PeerConnectionClient::SetRemoteDescObserver
   PeerConnectionClient* const parent_;
 };
 
-// ===========================================================================
-// 生命周期：构造 / Initialize / Close / 析构
-// ===========================================================================
-
 PeerConnectionClient::PeerConnectionClient() = default;
 
 PeerConnectionClient::~PeerConnectionClient() { Close(); }
 
 bool PeerConnectionClient::Initialize() {
-  // 第一步：初始化 OpenSSL/BoringSSL。WebRTC 内部用到 SSL（DTLS 加密 P2P 数据），
-  // 必须在创建 PeerConnection 前调用一次。重复调用也安全。
   webrtc::InitializeSSL();
-
-  // 第二步：启动三个 WebRTC 内部线程。
-  //
-  // 三个线程都是 webrtc::Thread（不是 std::thread），它们内部有事件循环，
-  // 可以接收 PostTask 调度的任务。
-  //
-  // 关键区别：
-  //   network_thread 必须用 CreateWithSocketServer()，里面带一个 SocketServer，
-  //   能跑 socket select/poll；其他两个用普通 Create()。
 
   network_thread_ = webrtc::Thread::CreateWithSocketServer();
   network_thread_->SetName("pc_network", nullptr);
@@ -199,13 +150,6 @@ bool PeerConnectionClient::Initialize() {
     return false;
   }
 
-  // 第三步：创建 Audio Device Module (ADM)。
-  // ADM 负责与操作系统音频设备交互（麦克风采集、扬声器播放）。
-  // 之前传 nullptr 导致麦克风没有打开，音频源产生全零数据。
-  // Windows 上使用 Core Audio API，需要 COM 初始化（MTA 模式）。
-  // 注意：不要手动调用 Init()/StartRecording()！
-  // PeerConnectionFactory 会在 worker 线程上自动初始化 ADM，
-  // 手动在主线程调用会失败（ADM 操作必须在 worker 线程执行）。
 #ifdef _WIN32
   com_initializer_ = std::make_unique<webrtc::ScopedCOMInitializer>(
       webrtc::ScopedCOMInitializer::kMTA);
@@ -219,14 +163,10 @@ bool PeerConnectionClient::Initialize() {
   adm_ = webrtc::CreateAudioDeviceModule(
       env, webrtc::AudioDeviceModule::kWindowsCoreAudio);
   if (!adm_) {
-    std::cerr << "[pc] CreateAudioDeviceModule failed\n";
+    std::cerr << "CreateAudioDeviceModule failed\n";
     return false;
   }
-  std::cerr << "[pc] audio device module created\n";
 
-  // 第四步：创建 PeerConnectionFactory。这是创建 PeerConnection 的工厂。
-  // Factory 会在 worker 线程上自动调用 adm_->Init()，
-  // 并在音频轨道激活时自动 StartRecording()。
   factory_ = webrtc::CreatePeerConnectionFactory(
       network_thread_.get(),
       worker_thread_.get(),
@@ -243,18 +183,13 @@ bool PeerConnectionClient::Initialize() {
     return false;
   }
 
-  // 第四步：配置并创建 PeerConnection。
   webrtc::PeerConnectionInterface::RTCConfiguration config;
-  // 新版 WebRTC 推荐用 UnifiedPlan（兼容浏览器、规范一致）。
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
 
-  // 加一个 STUN 服务器。同机调试用不到，但加上能让真实跨网络场景能跑。
   webrtc::PeerConnectionInterface::IceServer ice;
   ice.urls.push_back(kStunServer);
   config.servers.push_back(std::move(ice));
 
-  // PeerConnectionDependencies 必须传一个 PeerConnectionObserver。
-  // 我们把 this 传进去（本类就实现了 PeerConnectionObserver 接口）。
   webrtc::PeerConnectionDependencies deps(this);
 
   auto pc_or = factory_->CreatePeerConnectionOrError(config, std::move(deps));
@@ -264,7 +199,6 @@ bool PeerConnectionClient::Initialize() {
     return false;
   }
   pc_ = pc_or.MoveValue();
-  RTC_LOG(LS_INFO) << "[pc] initialized";
   return true;
 }
 
@@ -293,18 +227,11 @@ void PeerConnectionClient::Close() {
   network_thread_.reset();
 }
 
-// ===========================================================================
-// 业务侧调用的高层方法
-// ===========================================================================
-
 bool PeerConnectionClient::CreateOfferAndDataChannel() {
   if (!pc_) return false;
 
-  // 1. 先创建 DataChannel。注意：必须在 CreateOffer 之前创建，
-  //    这样 offer 里才有 data 的 m= section，B 端 SetRemoteSdp(offer) 时
-  //    才会触发 OnDataChannel 回调。
   webrtc::DataChannelInit init;
-  init.ordered = true;  // 有序送达。文字消息适合用 ordered+reliable（默认）。
+  init.ordered = true;
   auto dc_or = pc_->CreateDataChannelOrError(kDataChannelLabel, &init);
   if (!dc_or.ok()) {
     std::cerr << "[pc] CreateDataChannel failed: "
@@ -313,8 +240,6 @@ bool PeerConnectionClient::CreateOfferAndDataChannel() {
   }
   AttachDataChannel(dc_or.MoveValue());
 
-  // 2. 创建 Offer。WebRTC 异步生成，结果通过 CreateSdpObserver 回调。
-  //    完成后会触发 OnLocalSdpReady -> 调用业务方的 SdpReadyCallback。
   auto observer = webrtc::make_ref_counted<CreateSdpObserver>(this);
   webrtc::PeerConnectionInterface::RTCOfferAnswerOptions opts;
   pc_->CreateOffer(observer.get(), opts);
@@ -323,8 +248,6 @@ bool PeerConnectionClient::CreateOfferAndDataChannel() {
 
 bool PeerConnectionClient::CreateAnswer() {
   if (!pc_) return false;
-  // B 端的 CreateAnswer。前提：已经 SetRemoteSdp(kOffer, ...) 过了。
-  // 同样是异步，结果通过 OnLocalSdpReady 触发。
   auto observer = webrtc::make_ref_counted<CreateSdpObserver>(this);
   webrtc::PeerConnectionInterface::RTCOfferAnswerOptions opts;
   pc_->CreateAnswer(observer.get(), opts);
@@ -334,13 +257,11 @@ bool PeerConnectionClient::CreateAnswer() {
 bool PeerConnectionClient::SetRemoteSdp(webrtc::SdpType type,
                                        const std::string& sdp) {
   if (!pc_) return false;
-  // 把字符串 SDP 反序列化为 SessionDescriptionInterface 对象。
   auto desc = webrtc::CreateSessionDescription(type, sdp);
   if (!desc) {
     std::cerr << "[pc] CreateSessionDescription failed for SDP\n";
     return false;
   }
-  // 异步设置远端描述，结果通过 SetRemoteDescObserver 回调。
   auto observer = webrtc::make_ref_counted<SetRemoteDescObserver>(this);
   pc_->SetRemoteDescription(std::move(desc), observer);
   return true;
@@ -351,7 +272,6 @@ bool PeerConnectionClient::AddRemoteIceCandidate(const std::string& sdp_mid,
                                                  const std::string& sdp) {
   if (!pc_) return false;
 
-  // 从对端送来的 SDP 字符串重建 IceCandidate 对象。
   webrtc::SdpParseError err;
   auto candidate = webrtc::IceCandidate::Create(sdp_mid, sdp_mline_index, sdp,
                                                 &err);
@@ -360,7 +280,6 @@ bool PeerConnectionClient::AddRemoteIceCandidate(const std::string& sdp_mid,
     return false;
   }
 
-  // 异步加入到 PeerConnection。失败时通过 lambda 接收错误。
   pc_->AddIceCandidate(
       std::move(candidate),
       [](webrtc::RTCError e) {
@@ -369,27 +288,6 @@ bool PeerConnectionClient::AddRemoteIceCandidate(const std::string& sdp_mid,
         }
       });
   return true;
-}
-
-bool PeerConnectionClient::SendMessage(const std::string& text) {
-  webrtc::scoped_refptr<webrtc::DataChannelInterface> dc;
-  {
-    std::lock_guard<std::mutex> lock(dc_mutex_);
-    dc = dc_;
-  }
-  if (!dc) {
-    std::cerr << "[pc] no data channel yet\n";
-    return false;
-  }
-  if (dc->state() != webrtc::DataChannelInterface::kOpen) {
-    std::cerr << "[pc] data channel not open (state="
-              << webrtc::DataChannelInterface::DataStateString(dc->state())
-              << ")\n";
-    return false;
-  }
-
-  webrtc::DataBuffer buf(text);
-  return dc->Send(buf);
 }
 
 bool PeerConnectionClient::AddAudioTrack() {
@@ -422,28 +320,18 @@ bool PeerConnectionClient::AddAudioTrack() {
     return false;
   }
 
-  RTC_LOG(LS_INFO) << "[pc] audio track added";
   return true;
 }
 
-// ===========================================================================
-// 内部辅助：处理 SDP 异步结果
-// ===========================================================================
-
 void PeerConnectionClient::OnLocalSdpReady(
     std::unique_ptr<webrtc::SessionDescriptionInterface> desc) {
-  // 走到这里表示 CreateOffer 或 CreateAnswer 异步完成了。
-
-  // 拷一份信息出来，因为下一步 SetLocalDescription 会把 desc 的所有权拿走。
   webrtc::SdpType type = desc->GetType();
   std::string sdp;
   desc->ToString(&sdp);
 
-  // 把这份 SDP 设置成本端描述（必做，否则 PeerConnection 状态机不动）。
   auto observer = webrtc::make_ref_counted<SetLocalDescObserver>(this);
   pc_->SetLocalDescription(std::move(desc), observer);
 
-  // 通知业务侧"快把这段 SDP 通过信令送给对端"。
   if (sdp_ready_cb_) sdp_ready_cb_(type, sdp);
 }
 
@@ -456,25 +344,16 @@ void PeerConnectionClient::AttachDataChannel(
     webrtc::scoped_refptr<webrtc::DataChannelInterface> ch) {
   std::lock_guard<std::mutex> lock(dc_mutex_);
   dc_ = std::move(ch);
-  // 把"this"作为 observer 注册到 channel 上，这样 OnMessage / OnStateChange
-  // 会被回调到本类。
   dc_->RegisterObserver(this);
-  RTC_LOG(LS_INFO) << "[pc] data channel attached: " << dc_->label();
 }
-
-// ===========================================================================
-// PeerConnectionObserver 接口实现（WebRTC 内部线程回调过来）
-// ===========================================================================
 
 void PeerConnectionClient::OnSignalingChange(
     webrtc::PeerConnectionInterface::SignalingState new_state) {
-  // 仅打印，业务无关。
   if (state_cb_) state_cb_(SignalingStateName(new_state));
 }
 
 void PeerConnectionClient::OnDataChannel(
     webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) {
-  RTC_LOG(LS_INFO) << "[pc] OnDataChannel: " << data_channel->label();
   AttachDataChannel(std::move(data_channel));
 }
 
@@ -485,7 +364,6 @@ void PeerConnectionClient::OnTrack(
   if (track && track->kind() == webrtc::MediaStreamTrackInterface::kAudioKind) {
     auto* audio_track =
         static_cast<webrtc::AudioTrackInterface*>(track.get());
-    RTC_LOG(LS_INFO) << "[pc] OnTrack: remote audio track received";
     if (audio_track_cb_) audio_track_cb_(audio_track);
   }
 }
@@ -500,8 +378,6 @@ void PeerConnectionClient::OnIceGatheringChange(
 
 void PeerConnectionClient::OnIceCandidate(
     const webrtc::IceCandidate* candidate) {
-  // 关键：每次 ICE 发现一个本端地址候选，都通过这里通知我们。
-  // 业务侧必须把它通过信令送给对端，让对端 AddRemoteIceCandidate。
   if (!candidate || !ice_cb_) return;
   std::string sdp;
   candidate->ToString(&sdp);
@@ -518,12 +394,7 @@ void PeerConnectionClient::OnConnectionChange(
   if (state_cb_) state_cb_(PeerConnectionStateName(new_state));
 }
 
-// ===========================================================================
-// DataChannelObserver 接口实现
-// ===========================================================================
-
 void PeerConnectionClient::OnStateChange() {
-  // 拿一份当前状态。
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc;
   {
     std::lock_guard<std::mutex> lock(dc_mutex_);
@@ -534,15 +405,6 @@ void PeerConnectionClient::OnStateChange() {
     state_cb_(std::string("dc:") +
               webrtc::DataChannelInterface::DataStateString(dc->state()));
   }
-}
-
-void PeerConnectionClient::OnMessage(const webrtc::DataBuffer& buffer) {
-  // 收到对端发来的一条 DataChannel 消息。
-  // buffer.data 是字节数组（CopyOnWriteBuffer），buffer.binary 表示是不是
-  // 二进制（对面发字符串时是 false）。我们一律按文字处理。
-  if (!message_cb_) return;
-  std::string text(buffer.data.data<char>(), buffer.data.size());
-  message_cb_(text);
 }
 
 }  // namespace audiosub

@@ -14,21 +14,10 @@ bool PcmRingBuffer::Push(core::PcmFrame frame) {
   }
   if (queue_.size() >= capacity_frames_) {
     queue_.pop_front();
-    ++dropped_frames_;
   }
   queue_.push_back(std::move(frame));
   cv_.notify_one();
   return true;
-}
-
-std::optional<core::PcmFrame> PcmRingBuffer::Pop() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (queue_.empty()) {
-    return std::nullopt;
-  }
-  core::PcmFrame frame = std::move(queue_.front());
-  queue_.pop_front();
-  return frame;
 }
 
 std::optional<core::PcmFrame> PcmRingBuffer::WaitPop() {
@@ -48,21 +37,6 @@ void PcmRingBuffer::Close() {
     closed_ = true;
   }
   cv_.notify_all();
-}
-
-std::size_t PcmRingBuffer::size() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return queue_.size();
-}
-
-bool PcmRingBuffer::closed() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return closed_;
-}
-
-std::size_t PcmRingBuffer::dropped_frames() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return dropped_frames_;
 }
 
 }  // namespace audiosub::audio
