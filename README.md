@@ -20,7 +20,7 @@ AudioSub/
 ├── client/
 │   ├── audiosub_engine.{h,cc}      核心引擎：WebRTC/信令/ASR/融合接线，对外抛事件回调
 │   ├── peer_connection_client.*    WebRTC PeerConnection 封装
-│   ├── signaling_client.*          WebSocket 信令客户端
+│   ├── signaling_client.*          TCP + 行 JSON 信令客户端
 │   ├── wasapi_mic_capture.*        WASAPI 麦克风采集（备用音频链路）
 │   ├── main.cc                     CLI 外壳，链接核心引擎
 │   └── capi/                       C ABI DLL（audiosub_capi），供 GUI 动态调用
@@ -133,6 +133,8 @@ python signaling\server.py
 
 CLI 命令：`/talk on|off` 开关麦克风，`/note <文本>` 发送标注，`/quit` 退出。
 
+> 音频链路：默认走 `--audio-path webrtc`（WebRTC ADM 采集 + 内建 3A + Opus，经 RTP 媒体流传输，CLI 与 GUI 均为此默认）。另有对照链路 `--audio-path wasapi`（WASAPI 直采 raw PCM、绕开 3A，经 DataChannel 二进制帧传输），用于规避同机调试时降噪削弱人声导致的 ASR 幻觉。
+
 图形界面前端：
 
 ```powershell
@@ -172,7 +174,8 @@ python .\scripts\test_stage1b.py
 
 ## 文档导航
 
-- 当前实现链路总览: [docs/current-implementation-flow.md](docs/current-implementation-flow.md)
+- 链路详解（流程图 + 逐环节说明）: [docs/pipeline-deep-dive.md](docs/pipeline-deep-dive.md)
+- 当前实现链路总览（速查）: [docs/current-implementation-flow.md](docs/current-implementation-flow.md)
 - 新同学入组说明: [docs/new-collaborator-setup.md](docs/new-collaborator-setup.md)
 - 发群消息模板: [docs/team-message-template.md](docs/team-message-template.md)
 
