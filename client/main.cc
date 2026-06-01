@@ -39,14 +39,14 @@ void PrintUsage(const char* prog) {
             << "Optional:\n"
             << "  --host <host>    default: 127.0.0.1\n"
             << "  --port <port>    default: 8888\n"
-            << "  --audio-path <wasapi|webrtc> default: wasapi\n";
+            << "  --audio-path <wasapi|webrtc> default: webrtc\n";
 }
 
 struct Args {
   std::string id;
   std::string host = "127.0.0.1";
   int port = 8888;
-  std::string audio_path = "wasapi";
+  std::string audio_path = "webrtc";
 };
 
 bool ParseArgs(int argc, char** argv, Args* out) {
