@@ -1,69 +1,16 @@
-// peer_connection_client.h
-// ========================
-// WebRTC PeerConnection 的高层封装。把 WebRTC 那一堆"线程 + 工厂 + Observer +
-// Promise 风格异步"的复杂 API 包装成 4 个高层方法 + 4 个回调，业务层（main.cc）
-// 不需要直接接触 WebRTC 的细节。
-//
-// ============================================================================
-// WebRTC 协商流程速览（你看代码前必须先理解的概念）
-// ============================================================================
-//
-// 角色：
-//   - Offerer (A 端)：主动发起连接的一方
-//   - Answerer (B 端)：应答的一方
-//
-// 完整握手时序：
-//
-//   A 端                          信令服务器                   B 端
-//   |                                |                          |
-//   |  CreateOffer()                 |                          |
-//   |  生成 SDP Offer                |                          |
-//   |---- {type:"offer", sdp} ---->  |                          |
-//   |                                |--- {type:"offer"} ---->  |
-//   |                                |                          | SetRemoteDescription(offer)
-//   |                                |                          | CreateAnswer()
-//   |                                |                          | 生成 SDP Answer
-//   |                                | <-- {type:"answer"} ---- |
-//   |  <-- {type:"answer"} ---       |                          |
-//   |  SetRemoteDescription(answer)  |                          |
-//   |                                |                          |
-//   |   ---- ICE candidates ----     |   --- ICE candidates --- |
-//   |   双向交换网络地址候选          |   服务器纯转发            |
-//   |                                |                          |
-//   |   ICE 协商完成（NAT 穿透）     |                          |
-//   |   DTLS 握手完成（加密）        |                          |
-//   |   <===== P2P 通道建立 =====>   |  ===================>    |
-//   |                                |                          |
-//   |   <----- DataChannel 上下行直接走 P2P，绕过服务器 ----->  |
-//
-// 关键名词：
-//   - SDP (Session Description Protocol)：一段文本，描述本端支持的编解码、
-//     ICE 凭证、媒体轨道等。Offer 和 Answer 都是 SDP。
-//   - ICE Candidate：一个"我可以在 IP:Port 这里被联系到"的候选地址。一端会
-//     生成多条 candidate（公网 IP、私网 IP、relay 等），通过信令交换给对端，
-//     最后两端各自选出一条能互通的 pair。
-//   - DTLS：在 UDP 上做 TLS，让 P2P 通道加密。WebRTC 内部自动处理。
-//   - DataChannel：基于 SCTP 的可靠/有序消息通道，类似 WebSocket，但走 P2P。
-//
-// ============================================================================
-// 本类对外接口
-// ============================================================================
-//
-// 4 个方法（由业务/信令侧调用）：
-//   Initialize()                  启动 3 个内部线程，创建 Factory + PeerConnection
-//   CreateOfferAndDataChannel()   A 端：开 channel + 创建 offer
-//   CreateAnswer()                B 端：收到 offer 后回 answer
-//   SetRemoteSdp() / AddRemoteIceCandidate()  接收对端 SDP / ICE
-//   SendMessage()                 通过 DataChannel 发文字（P2P 直连）
-//
-// 4 个回调（由本类异步触发，业务侧设置）：
-//   SdpReadyCallback        本端 SDP 生成好了，业务侧应该发给对端
-//   IceCandidateCallback    本端发现一个 ICE candidate，业务侧应该发给对端
-//   MessageCallback         对端通过 DataChannel 发来一条文字
-//   StateCallback           连接状态变化（信令/ICE/DataChannel 等）
-//
-// 业务层只要"按提示办事"：回调里说要送出什么，就通过信令送出。
-// ============================================================================
+// WebRTC PeerConnection 的高层封装
+
+// 核心方法
+// Initialize()                         初始化 WebRTC，创建线程、Factory、PeerConnection 等
+// CreateOfferAndDataChannel()          A 端发起协商，开 channel + 创建 offer
+// EnableLocalAudio()                   启用本地音频轨道，开始发送音频数据
+// SetLocalAudioEnabled()               控制语音讲话开关
+// CreateAnswer()                       B 端收到 offer 后， 生成 answer 并回 channel
+// SetRemoteSdp()                       接收对端 SDP / ICE
+// AddRemoteIceCandidate()              接收对端 ICE candidate
+// SendMessage()                        通过 DataChannel 发文字（P2P 直连）
+
+
 
 #pragma once
 
@@ -73,12 +20,20 @@
 #include <mutex>
 #include <string>
 
+#include "core/types.h"
+#include "wasapi_mic_capture.h"
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
+
+namespace webrtc {
+class ScopedCOMInitializer;
+class AudioDeviceModule;
+class Environment;
+}
 
 namespace audiosub {
 
@@ -105,6 +60,15 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 收到对端通过 DataChannel 发来的一条文字消息。
   using MessageCallback = std::function<void(const std::string& text)>;
 
+  // 收到远端音频轨道解码后的 PCM 数据。用于把 WebRTC 音频链路接到后续
+  // ring buffer / audio pipeline / ASR。
+  using RemoteAudioFrameCallback =
+      std::function<void(const core::PcmFrame& frame)>;
+
+  // 收到本地麦克风轨道上的 PCM 数据。用于确认 A 端本地采集是否真的有声音。
+  using LocalAudioFrameCallback =
+      std::function<void(const core::PcmFrame& frame)>;
+
   // 状态变化通知（信令状态、ICE 状态、PeerConnection 状态、DataChannel 状态等）。
   // 仅用于打印/UI 显示，不影响逻辑。
   using StateCallback = std::function<void(const std::string& state)>;
@@ -116,13 +80,38 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   PeerConnectionClient(const PeerConnectionClient&) = delete;
   PeerConnectionClient& operator=(const PeerConnectionClient&) = delete;
 
+  enum class AudioPath {
+    // 旧链路：A 端 WASAPI 直采 raw PCM，经 DataChannel binary 发给 B。
+    kWasapiDataChannel,
+
+    // 新链路：A 端 WebRTC AudioTrack 采集，B 端从 AudioTrackSinkInterface 取 PCM。
+    kWebrtcTrack,
+  };
+
   // 启动 WebRTC：建 3 个线程、创建 Factory、创建 PeerConnection。
-  // 必须先调它，再调其他业务方法。失败返回 false。
+  // enable_audio_device 只应在需要本地麦克风采集的一端开启。
+  // B 端只需要从远端 AudioTrackSinkInterface 取 PCM，不需要真实播放设备；
+  // 关闭它可以避免 WebRTC 默认把远端音频播放到扬声器，导致同机测试听见自己。
   bool Initialize();
 
   // A 端入口：创建一个名为 "chat" 的 DataChannel，然后生成 Offer。
   // Offer 生成完会通过 SdpReadyCallback 通知业务侧。
   bool CreateOfferAndDataChannel();
+
+  // 在本端挂一条来自系统麦克风的音频轨道。
+  // 约定在 A 端创建 Offer 之前调用一次，让首个 Offer 就带上音频 m= section。
+  bool EnableLocalAudio();
+
+  // 控制本地音频轨道是否向对端发送有效语音。
+  // true  表示 A 端开始讲话；
+  // false 表示 A 端结束讲话（轨道仍保留，但发送静音）。
+  bool SetLocalAudioEnabled(bool enabled);
+
+  // 设置音频链路模式。默认是 WASAPI + DataChannel，保持原有行为。
+  // 约定在 Initialize() 后、EnableLocalAudio()/CreateOfferAndDataChannel() 前调用。
+  void SetAudioPath(AudioPath path) {
+    audio_path_.store(path, std::memory_order_relaxed);
+  }
 
   // B 端入口：在 SetRemoteSdp(kOffer, ...) 之后调用，生成 Answer。
   // Answer 生成完通过 SdpReadyCallback 通知。
@@ -147,6 +136,12 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   void SetSdpReadyCallback(SdpReadyCallback cb) { sdp_ready_cb_ = std::move(cb); }
   void SetIceCandidateCallback(IceCandidateCallback cb) { ice_cb_ = std::move(cb); }
   void SetMessageCallback(MessageCallback cb) { message_cb_ = std::move(cb); }
+  void SetRemoteAudioFrameCallback(RemoteAudioFrameCallback cb) {
+    remote_audio_frame_cb_ = std::move(cb);
+  }
+  void SetLocalAudioFrameCallback(LocalAudioFrameCallback cb) {
+    local_audio_frame_cb_ = std::move(cb);
+  }
   void SetStateCallback(StateCallback cb) { state_cb_ = std::move(cb); }
 
   // === PeerConnectionObserver 接口实现（WebRTC 触发） ===
@@ -160,6 +155,11 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // 我们在这里 RegisterObserver，绑定到 this 上接收消息。
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override;
+
+  // Unified Plan 下，远端媒体轨道会在 SetRemoteDescription 过程中从这里到达。
+  // 第一个需求需要在这里抓到远端音频轨道并注册 PCM sink。
+  void OnTrack(
+      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
 
   // 协商需要重新走一遍（比如改了媒体配置）。我们暂时不处理。
   void OnRenegotiationNeeded() override {}
@@ -197,6 +197,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   class CreateSdpObserver;       // 接 CreateOffer/CreateAnswer 的异步结果
   class SetLocalDescObserver;    // 接 SetLocalDescription 的异步结果
   class SetRemoteDescObserver;   // 接 SetRemoteDescription 的异步结果
+  class RemoteAudioSink;         // 把 WebRTC AudioTrack 回调转成统一 PcmFrame
+  class AdmCaptureObserver;      // 直接从音频设备层拿本地麦克风 PCM
 
   // CreateOffer/CreateAnswer 成功后被嵌套类调用。
   void OnLocalSdpReady(std::unique_ptr<webrtc::SessionDescriptionInterface> desc);
@@ -210,6 +212,10 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   void AttachDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> ch);
 
+  // 供 RemoteAudioSink 回调，把 PCM 转交给业务侧。
+  void DeliverLocalAudioFrame(const core::PcmFrame& frame);
+  void DeliverRemoteAudioFrame(const core::PcmFrame& frame);
+
   // === 状态 ===
 
   // WebRTC 的 3 个内部线程，规范要求：
@@ -220,6 +226,11 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   std::unique_ptr<webrtc::Thread> network_thread_;
   std::unique_ptr<webrtc::Thread> worker_thread_;
   std::unique_ptr<webrtc::Thread> signaling_thread_;
+
+  // 本地麦克风采集依赖平台音频设备模块。Windows 下需要先把当前线程初始化为 COM。
+  std::unique_ptr<webrtc::ScopedCOMInitializer> com_initializer_;
+  std::unique_ptr<webrtc::Environment> env_;
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm_;
 
   // PeerConnectionFactory 是创建 PeerConnection 的工厂。整个进程一般共享一个，
   // 这里为了简化每个 PeerConnectionClient 自己持有一份。
@@ -233,10 +244,41 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   std::mutex dc_mutex_;
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc_;
 
+  // 本地发送的麦克风轨道，以及远端到达后绑定 sink 的音频轨道。
+  // 注：当前 P0 链路下，A 端音频实际走 WASAPI + DataChannel 二进制路径，
+  // 这些 AudioTrack 成员仅保留以兼容 SDP 协商时已有的 audio m= section，
+  // 真正的 PCM 不再依赖 WebRTC 编解码 / NS / AEC / AGC。
+  std::mutex audio_mutex_;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> local_audio_source_;
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> local_audio_track_;
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> remote_audio_track_;
+  std::unique_ptr<RemoteAudioSink> remote_audio_sink_;
+
+  // WASAPI 直采路径，绕开 WebRTC 音频处理管线。
+  // A 端启用本地音频时启动，把 raw int16 mono PCM 通过 DataChannel 发到对端。
+  WasapiMicCapture wasapi_mic_;
+  // /talk on / off 控制实际是否往 DataChannel 推送 PCM 包。
+  std::atomic<bool> wasapi_talking_{false};
+
+  // 当前音频链路模式。默认保持旧逻辑，避免影响已有测试路径。
+  std::atomic<AudioPath> audio_path_{AudioPath::kWasapiDataChannel};
+
+  // 把 raw int16 PCM 封装成 PcmDcHeader + 数据，通过 DataChannel 发送。
+  // 返回 false 表示 DataChannel 未就绪或对象状态异常。
+  bool SendPcmDataChannel(const int16_t* samples,
+                          std::size_t sample_count,
+                          int sample_rate,
+                          int channels);
+
+  // 收到 binary DataChannel 消息时，按 PcmDcHeader 协议解包后投递给业务回调。
+  void HandlePcmDataChannel(const webrtc::DataBuffer& buffer);
+
   // === 业务回调 ===
   SdpReadyCallback sdp_ready_cb_;
   IceCandidateCallback ice_cb_;
   MessageCallback message_cb_;
+  LocalAudioFrameCallback local_audio_frame_cb_;
+  RemoteAudioFrameCallback remote_audio_frame_cb_;
   StateCallback state_cb_;
 };
 

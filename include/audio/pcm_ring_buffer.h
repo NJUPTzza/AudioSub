@@ -7,7 +7,7 @@
 #include <mutex>
 #include <optional>
 
-#include "audiosub/core/types.h"
+#include "core/types.h"
 
 namespace audiosub::audio {
 
