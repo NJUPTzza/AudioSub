@@ -3,6 +3,7 @@ out/
 dist/
 *.user
 *.vs/
+.vscode/
 .idea/
 __pycache__/
 *.pyc

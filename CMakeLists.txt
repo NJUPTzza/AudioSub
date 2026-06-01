@@ -114,9 +114,7 @@ target_include_directories(audiosub_core INTERFACE
 
 add_library(audiosub_audio STATIC
     "${CMAKE_SOURCE_DIR}/src/audio/pcm_ring_buffer.cc"
-    "${CMAKE_SOURCE_DIR}/src/audio/pass_through_audio_pipeline.cc"
     "${CMAKE_SOURCE_DIR}/src/audio/asr_audio_converter.cc"
-    "${CMAKE_SOURCE_DIR}/src/audio/asr_chunker.cc"
 )
 add_library(audiosub::audio ALIAS audiosub_audio)
 target_link_libraries(audiosub_audio PUBLIC audiosub::core)
@@ -125,7 +123,6 @@ target_include_directories(audiosub_audio PUBLIC
 )
 
 add_library(audiosub_asr STATIC
-    "${CMAKE_SOURCE_DIR}/src/asr/null_asr_engine.cc"
     "${CMAKE_SOURCE_DIR}/src/asr/whisper_cpp_engine.cc"
 )
 add_library(audiosub::asr ALIAS audiosub_asr)
@@ -140,3 +137,12 @@ target_include_directories(audiosub_asr PUBLIC
 )
 
 add_subdirectory(client)
+
+# --- Qt GUI 前端（可选）---
+# 通过 C ABI DLL(audiosub_capi) 访问引擎，自身用 /MD，独立于 WebRTC 的 /MT。
+option(AUDIOSUB_BUILD_GUI "Build the Qt GUI front-end" ON)
+if(AUDIOSUB_BUILD_GUI)
+    set(QT_PREFIX_PATH "E:/Qt/6.11.1/msvc2022_64" CACHE PATH "Qt install prefix")
+    list(APPEND CMAKE_PREFIX_PATH "${QT_PREFIX_PATH}")
+    add_subdirectory(gui)
+endif()
