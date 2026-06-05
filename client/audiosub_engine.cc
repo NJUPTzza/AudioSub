@@ -39,6 +39,9 @@ void DrainBuffer(audio::PcmRingBuffer& buffer) {
   }
 }
 
+// 投递给 ASR 线程的 flush 哨兵帧（sample_rate 取非法值，不会与真实 PCM 混淆）。
+constexpr int kAsrFlushSignalSampleRate = -1;
+
 }  // namespace
 
 AudiosubEngine::AudiosubEngine() = default;
@@ -121,6 +124,12 @@ bool AudiosubEngine::Start(const Config& cfg) {
   // ASR 消费线程：48k/stereo -> 16k/mono -> whisper。
   asr_worker_ = std::thread([this] {
     while (auto frame = remote_audio_asr_buffer_.WaitPop()) {
+      if (frame->sample_rate == kAsrFlushSignalSampleRate) {
+        if (asr_engine_) {
+          asr_engine_->FlushPending();
+        }
+        continue;
+      }
       core::PcmFrame asr_frame = asr_converter_.ToAsrFormat(*frame);
       if (asr_frame.samples.empty()) continue;
       asr_engine_->PushAudio(asr_frame);
@@ -225,7 +234,18 @@ bool AudiosubEngine::Start(const Config& cfg) {
 
 bool AudiosubEngine::SetTalking(bool on) {
   if (!is_offerer_) return false;  // 只有 A 能控制本地麦克风
-  return pc_.SetLocalAudioEnabled(on);
+  const bool ok = pc_.SetLocalAudioEnabled(on);
+  // 停止说话时 B 端不再收到尾段静音帧，VAD 无法自动 flush；通知 B 立即识别。
+  if (ok && !on) {
+    pc_.SendMessage(R"({"type":"asr_flush"})");
+  }
+  return ok;
+}
+
+void AudiosubEngine::RequestAsrFlush() {
+  core::PcmFrame sentinel;
+  sentinel.sample_rate = kAsrFlushSignalSampleRate;
+  remote_audio_asr_buffer_.Push(std::move(sentinel));
 }
 
 bool AudiosubEngine::SendNote(const std::string& utf8_text) {
@@ -292,6 +312,11 @@ void AudiosubEngine::HandlePeerMessage(const std::string& text) {
       nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
   if (!j.is_discarded() && j.is_object() && j.contains("type")) {
     const std::string type = j.value("type", "");
+
+    if (type == "asr_flush") {
+      RequestAsrFlush();
+      return;
+    }
 
     if (type == "annotation") {
       core::MarkMessage mark;

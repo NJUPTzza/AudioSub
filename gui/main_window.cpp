@@ -13,9 +13,47 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QStyle>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
+
+namespace {
+
+struct AudioPathDisplay {
+  QString label;
+  QString tooltip;
+  const char* styleId;  // audioPathWebrtc | audioPathWasapi
+};
+
+AudioPathDisplay DescribeAudioPath(const QString& audioPath) {
+  if (audioPath.compare("wasapi", Qt::CaseInsensitive) == 0) {
+    return {QStringLiteral("WASAPI 直采 · DC"),
+            QStringLiteral("WASAPI 麦克风直采 → DataChannel 二进制 PCM（对照链路）"),
+            "audioPathWasapi"};
+  }
+  if (audioPath.compare("webrtc", Qt::CaseInsensitive) == 0) {
+    return {QStringLiteral("WebRTC 音轨 · RTP"),
+            QStringLiteral("ADM 采集 → 3A → Opus → RTP 媒体流（默认链路）"),
+            "audioPathWebrtc"};
+  }
+  return {QStringLiteral("音频链路未知"),
+          QStringLiteral("请使用 --audio-path webrtc 或 wasapi 启动"),
+          "audioPathUnknown"};
+}
+
+void ApplyAudioPathBadge(QLabel* badge, const AudioPathDisplay& info) {
+  if (!badge) {
+    return;
+  }
+  badge->setText(info.label);
+  badge->setObjectName(info.styleId);
+  badge->setToolTip(info.tooltip);
+  badge->style()->unpolish(badge);
+  badge->style()->polish(badge);
+}
+
+}  // namespace
 
 // ============================ Backend ============================
 
@@ -198,6 +236,10 @@ MainWindow::MainWindow(const QString& id, const QString& host, int port,
   headerTitle_->setObjectName("chatTitle");
   chl->addWidget(headerTitle_);
   chl->addStretch(1);
+  const AudioPathDisplay pathInfo = DescribeAudioPath(audioPath);
+  audioPathBadge_ = new QLabel(chatHeader);
+  ApplyAudioPathBadge(audioPathBadge_, pathInfo);
+  chl->addWidget(audioPathBadge_);
   rv->addWidget(chatHeader);
 
   // 指标条
@@ -271,6 +313,18 @@ MainWindow::MainWindow(const QString& id, const QString& host, int port,
     QLabel#contactSub { font-size:12px; color:#8F959E; }
     QFrame#chatHeader { background:#FFFFFF; border-bottom:1px solid #EEF0F3; }
     QLabel#chatTitle { font-size:16px; font-weight:600; color:#1F2329; }
+    QLabel#audioPathWebrtc, QLabel#audioPathWasapi, QLabel#audioPathUnknown {
+      font-size:12px; font-weight:500; border-radius:10px; padding:4px 10px;
+    }
+    QLabel#audioPathWebrtc {
+      background:#E8F0FF; color:#245BDB; border:1px solid #C8DAFF;
+    }
+    QLabel#audioPathWasapi {
+      background:#FFF3E8; color:#D46B08; border:1px solid #FFD8BF;
+    }
+    QLabel#audioPathUnknown {
+      background:#F2F3F5; color:#8F959E; border:1px solid #E5E6EB;
+    }
     QFrame#metricBar { background:#FAFBFC; border-bottom:1px solid #EEF0F3; }
     QLabel#metric { color:#8F959E; font-size:12px; }
     QScrollArea#chatScroll, QWidget#chatBody { background:#F5F6F7; }
@@ -469,6 +523,12 @@ void MainWindow::onState(QString line) {
   }
   if (line.contains("connected", Qt::CaseInsensitive)) {
     statusLabel_->setText("已连接");
+  }
+  if (line.contains("audio:path-webrtc-track")) {
+    ApplyAudioPathBadge(audioPathBadge_, DescribeAudioPath("webrtc"));
+  }
+  if (line.contains("audio:path-wasapi-datachannel")) {
+    ApplyAudioPathBadge(audioPathBadge_, DescribeAudioPath("wasapi"));
   }
 }
 

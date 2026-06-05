@@ -42,9 +42,13 @@ class SubtitleMarkFuser {
 
     std::lock_guard<std::mutex> lock(mutex_);
     for (Entry& e : entries_) {
+      // 一条标注只能挂到一条字幕；已认领的直接跳过，避免容差重叠时重复挂载。
+      if (e.claimed) {
+        continue;
+      }
       // 核心对齐判断：标注发生时刻是否落在字幕时间范围内。
       // 加一点容差 kToleranceMs：标注往往比"开始说话"晚几百毫秒敲下，
-      // 字幕的 end_ms 又是"识别完成"时刻，给点缓冲匹配更稳。
+      // 字幕 end_ms 侧也给缓冲，应对 VAD 截断与按键延迟。
       if (e.mark.event_time_ms >= sub.start_ms - kToleranceMs &&
           e.mark.event_time_ms <= sub.end_ms + kToleranceMs) {
         out.marks.push_back(e.mark);

@@ -109,6 +109,7 @@ class MainWindow : public QMainWindow {
 
   QLabel* statusLabel_ = nullptr;     // 侧栏联系人下方状态行
   QLabel* headerTitle_ = nullptr;     // 右侧顶栏标题（对端名）
+  QLabel* audioPathBadge_ = nullptr;  // 顶栏音频链路标识
   QLabel* contactName_ = nullptr;     // 侧栏联系人名
   QLabel* contactAvatar_ = nullptr;   // 侧栏联系人头像
   QScrollArea* chatScroll_ = nullptr;

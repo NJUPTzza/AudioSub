@@ -134,6 +134,8 @@ void WhisperCppEngine::PushAudio(const core::PcmFrame& frame) {
     return;
   }
 
+  std::lock_guard<std::mutex> infer_lock(inference_mutex_);
+
   // 这一帧是不是有人在说话？仅用于驱动 VAD 状态机，**音频本身仍然要入缓冲**。
   // 不要直接丢静音帧，否则一句话说完后的停顿不会进入缓存，
   // 会导致上一句话要等下一句话补足缓存后才显示。
@@ -153,6 +155,7 @@ void WhisperCppEngine::PushAudio(const core::PcmFrame& frame) {
   if (has_speech) {
     segment_has_speech_ = true;
     silence_frame_count_ = 0;
+    last_speech_wall_ms_ = NowUnixMs();
   } else if (segment_has_speech_) {
     ++silence_frame_count_;
   }
@@ -172,11 +175,26 @@ void WhisperCppEngine::PushAudio(const core::PcmFrame& frame) {
 
   if (long_enough || speech_ended) {
     RunInference();
-    pending_pcm_.clear();
-    pending_start_wall_ms_ = 0;
-    segment_has_speech_ = false;
-    silence_frame_count_ = 0;
+    ResetSegmentState();
   }
+}
+
+void WhisperCppEngine::FlushPending() {
+  std::lock_guard<std::mutex> infer_lock(inference_mutex_);
+  if (!ctx_ || !consumer_ || pending_pcm_.empty() || !segment_has_speech_) {
+    ResetSegmentState();
+    return;
+  }
+  RunInference();
+  ResetSegmentState();
+}
+
+void WhisperCppEngine::ResetSegmentState() {
+  pending_pcm_.clear();
+  pending_start_wall_ms_ = 0;
+  segment_has_speech_ = false;
+  silence_frame_count_ = 0;
+  last_speech_wall_ms_ = 0;
 }
 
 void WhisperCppEngine::RunInference() {
@@ -282,7 +300,9 @@ void WhisperCppEngine::RunInference() {
 
   const int64_t start_ms =
       pending_start_wall_ms_ > 0 ? pending_start_wall_ms_ : NowUnixMs();
-  const int64_t end_ms = NowUnixMs();
+  // 用最后一次检测到语音的时刻作为结束时间，不用推理完成时刻。
+  const int64_t end_ms =
+      last_speech_wall_ms_ >= start_ms ? last_speech_wall_ms_ : NowUnixMs();
 
   core::SubtitleSegment seg;
   seg.start_ms = start_ms;

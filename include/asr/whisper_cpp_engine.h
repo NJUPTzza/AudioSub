@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -24,12 +25,15 @@ class WhisperCppEngine : public core::IASREngine {
 
   bool Initialize();
   void PushAudio(const core::PcmFrame& frame) override;
+  // A 端停止说话时调用：强制识别缓冲里尚未 flush 的语音段。
+  void FlushPending();
   void SetSubtitleConsumer(core::ISubtitleConsumer* consumer) override {
     consumer_ = consumer;
   }
 
  private:
   void RunInference();
+  void ResetSegmentState();
 
   std::string model_path_;
   whisper_context* ctx_ = nullptr;
@@ -49,6 +53,11 @@ class WhisperCppEngine : public core::IASREngine {
   bool segment_has_speech_ = false;
   // 连续静音帧计数，用来检测"说话结束"。
   int silence_frame_count_ = 0;
+  // 本段音频里最后一次检测到语音的现实时间；用作字幕 end_ms（说话结束），
+  // 而不是 whisper 推理完成时刻，避免把下一句的时间也算进上一句窗口。
+  int64_t last_speech_wall_ms_ = 0;
+
+  mutable std::mutex inference_mutex_;
 
   static constexpr int kTargetSampleRate = 16000;
   static constexpr int kSegmentSeconds = 4;

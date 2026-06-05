@@ -749,8 +749,8 @@ bool PeerConnectionClient::AddRemoteIceCandidate(const std::string& sdp_mid,
   return true;
 }
 
-bool PeerConnectionClient::SendMessage(const std::string& text) {
-  // 拿一份 dc_ 的快照（多线程下避免长时间持锁）。
+bool PeerConnectionClient::SendDataChannelBuffer(
+    const webrtc::DataBuffer& buffer) {
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc;
   {
     std::lock_guard<std::mutex> lock(dc_mutex_);
@@ -760,18 +760,20 @@ bool PeerConnectionClient::SendMessage(const std::string& text) {
     std::cerr << "[pc] no data channel yet\n";
     return false;
   }
-  // 必须是 open 状态才能发。kConnecting 时 send 会被丢弃。
   if (dc->state() != webrtc::DataChannelInterface::kOpen) {
     std::cerr << "[pc] data channel not open (state="
               << webrtc::DataChannelInterface::DataStateString(dc->state())
               << ")\n";
     return false;
   }
+  std::lock_guard<std::mutex> send_lock(dc_send_mutex_);
+  return dc->Send(buffer);
+}
 
+bool PeerConnectionClient::SendMessage(const std::string& text) {
   // DataBuffer(string) 会构造一个 binary=false 的"文字"buffer。对端 OnMessage
   // 收到时也会知道这是文字。
-  webrtc::DataBuffer buf(text);
-  return dc->Send(buf);
+  return SendDataChannelBuffer(webrtc::DataBuffer(text));
 }
 
 // ===========================================================================
@@ -953,16 +955,6 @@ bool PeerConnectionClient::SendPcmDataChannel(const int16_t* samples,
                                               int channels) {
   if (!samples || sample_count == 0) return false;
 
-  // 取一份 DataChannel 智能指针，避免在持锁期间走网络栈。
-  webrtc::scoped_refptr<webrtc::DataChannelInterface> dc;
-  {
-    std::lock_guard<std::mutex> lock(dc_mutex_);
-    dc = dc_;
-  }
-  if (!dc || dc->state() != webrtc::DataChannelInterface::kOpen) {
-    return false;
-  }
-
   PcmDcHeader header{};
   header.magic[0] = 'P';
   header.magic[1] = 'C';
@@ -982,7 +974,7 @@ bool PeerConnectionClient::SendPcmDataChannel(const int16_t* samples,
   webrtc::CopyOnWriteBuffer cow;
   cow.AppendData(packet.data(), packet.size());
   webrtc::DataBuffer data_buffer(cow, /*binary=*/true);
-  return dc->Send(data_buffer);
+  return SendDataChannelBuffer(data_buffer);
 }
 
 void PeerConnectionClient::HandlePcmDataChannel(

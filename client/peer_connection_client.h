@@ -253,6 +253,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
   // DataChannel 可能被多个线程访问（业务线程 SendMessage、WebRTC 内部线程
   // 触发 OnMessage），用 mutex 保护它的指针读写。
   std::mutex dc_mutex_;
+  // dc->Send 非线程安全：WASAPI 采集线程推 PCM 与 GUI 发标注可能并发，需串行化。
+  std::mutex dc_send_mutex_;
   webrtc::scoped_refptr<webrtc::DataChannelInterface> dc_;
 
   // 本地发送的麦克风轨道，以及远端到达后绑定 sink 的音频轨道。
@@ -280,6 +282,8 @@ class PeerConnectionClient : public webrtc::PeerConnectionObserver,
                           std::size_t sample_count,
                           int sample_rate,
                           int channels);
+
+  bool SendDataChannelBuffer(const webrtc::DataBuffer& buffer);
 
   // 收到 binary DataChannel 消息时，按 PcmDcHeader 协议解包后投递给业务回调。
   void HandlePcmDataChannel(const webrtc::DataBuffer& buffer);

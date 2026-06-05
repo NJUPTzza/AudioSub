@@ -121,6 +121,8 @@ class AudiosubEngine : public core::ISubtitleConsumer {
  private:
   // 收到对端 DataChannel 文本消息的处理（区分 annotation / subtitle / 普通文本）。
   void HandlePeerMessage(const std::string& text);
+  // 把 ASR flush 请求投递到 ASR 线程，避免在 WebRTC 线程直接调 whisper。
+  void RequestAsrFlush();
 
   // 指标累计（线程安全）。
   void AddRtt(std::int64_t v);
